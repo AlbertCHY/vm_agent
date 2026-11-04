@@ -1,0 +1,11 @@
+# 直接相依 (版本範圍)；鎖版結果由下列指令產生至 requirements.txt：
+#   uv pip compile requirements.in -o requirements.txt
+langgraph>=1.0
+langgraph-checkpoint-sqlite>=3.0
+langchain>=1.0
+langchain-google-genai>=4.4.0
+pydantic>=2.10.0
+python-dotenv>=1.0.0
+requests>=2.32.0
+rich>=13.0.0
+paramiko>=3.4.0

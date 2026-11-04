@@ -1,0 +1,4 @@
+# 開發 / 測試用相依：
+#   uv pip compile requirements-dev.in -o requirements-dev.txt
+-c requirements.txt
+pytest>=8.0

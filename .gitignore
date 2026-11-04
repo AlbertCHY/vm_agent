@@ -1,0 +1,20 @@
+.env
+.vscode/
+__pycache__/
+.venv/
+.pytest_cache/
+
+# 執行期資料 (工單、密碼紀錄、checkpoint 資料庫)
+tickets/*
+!tickets/.gitkeep
+logs/
+data/
+
+# 大型安裝檔
+CrowdStrike/
+
+# 含內部資訊的本機設定 (提交對應的 *.example.toml)
+prompts.local.toml
+policies/*.toml
+!policies/*.example.toml
+!policies/bootstrap_steps.toml

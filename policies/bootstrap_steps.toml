@@ -1,0 +1,94 @@
+# ════════════════════════════════════════════════════════════════
+# 新 Linux VM 基本設定 (Bootstrap) 步驟定義 — 依序執行
+#
+# 樣板變數 (用於 env，會出現在遠端命令列，請勿放機密)：
+#   {ip} {hostname} {init_user} {user1} {user2} {pub_key}
+#   {cs_mode} {cs_proxy_host} {cs_proxy_port} {zabbix_servers} {zabbix_conf}
+# 機密樣板變數 (只能用於 secret_env，會以權限 600 的暫存檔傳遞並在載入後立即刪除)：
+#   {admin_password} {user2_password} {mdr_cid} {mdr_token} {ngav_cid} {ngav_token}
+#
+# 欄位說明：
+#   script           scripts/bootstrap/ 下的腳本檔名 (會上傳到 [upload].remote_dir)
+#   sudo             是否以 sudo 執行
+#   sudo_password    以目前登入密碼 sudo -S 提權 (免密 sudo 設定完成前使用)
+#   skip_if          context 中的布林旗標，為 true 時略過 (cs_skip / disk_skip)
+#   stop_on_fail     失敗時停止後續步驟，直接進入清理
+#   rotates_password 成功後改用新密碼登入，並留存密碼紀錄
+#   timeout          指令逾時秒數 (預設 120)
+#   值為空字串的環境變數不會傳遞。
+# ════════════════════════════════════════════════════════════════
+
+[upload]
+remote_dir = "/tmp"
+crowdstrike_remote_dir = "/tmp/CrowdStrike"
+
+[[steps]]
+id = "add_pub_key"
+name = "部署管理帳號 SSH 公鑰 (add_pub_key.sh)"
+script = "add_pub_key.sh"
+sudo = false
+env = { TARGET_USER = "{user1}", SSH_PUB_KEY = "{pub_key}" }
+
+[[steps]]
+id = "set_no_passwd"
+name = "設定管理帳號免密碼 sudo (set_no_passwd.sh)"
+script = "set_no_passwd.sh"
+sudo = true
+sudo_password = true
+stop_on_fail = true
+env = { TARGET_USER = "{user1}" }
+
+[[steps]]
+id = "set_hostname"
+name = "變更 Hostname 與 /etc/hosts (set_hostname.sh)"
+script = "set_hostname.sh"
+sudo = true
+env = { NEW_HOSTNAME = "{hostname}", TARGET_IP = "{ip}" }
+
+[[steps]]
+id = "set_passwords"
+name = "修改 root 與固定帳號密碼 (set_passwords.sh)"
+script = "set_passwords.sh"
+sudo = true
+stop_on_fail = true
+rotates_password = true
+env = { USER1 = "{user1}", USER2 = "{user2}" }
+secret_env = { PW_ROOT = "{admin_password}", PW_USER1 = "{admin_password}", PW_USER2 = "{user2_password}" }
+
+[[steps]]
+id = "set_zabbix"
+name = "更新 Zabbix Agent 設定與重啟服務 (set_zabbix.sh)"
+script = "set_zabbix.sh"
+sudo = true
+env = { TARGET_IP = "{ip}", ZABBIX_SERVERS = "{zabbix_servers}", ZABBIX_CONF = "{zabbix_conf}" }
+
+[[steps]]
+id = "set_crowdstrike"
+name = "安裝與設定 CrowdStrike ({cs_mode}) (set_crowdstrike.sh)"
+script = "set_crowdstrike.sh"
+sudo = true
+skip_if = "cs_skip"
+env = { CS_INSTALL_TYPE = "{cs_mode}", CS_PROXY_HOST = "{cs_proxy_host}", CS_PROXY_PORT = "{cs_proxy_port}" }
+secret_env = { MDR_CID = "{mdr_cid}", MDR_TOKEN = "{mdr_token}", NGAV_CID = "{ngav_cid}", NGAV_TOKEN = "{ngav_token}" }
+
+[[steps]]
+id = "expand_root_disk"
+name = "重新掃描系統碟並以 LVM 擴容根目錄 / (expand_root_disk.sh)"
+script = "expand_root_disk.sh"
+sudo = true
+skip_if = "disk_skip"
+
+[[steps]]
+id = "mount_extra_disk"
+name = "掃描額外硬碟並以 LVM 掛載 /data (mount_extra_disk.sh)"
+script = "mount_extra_disk.sh"
+sudo = true
+skip_if = "disk_skip"
+env = { VG_NAME = "datavg01", LV_NAME = "datalv01", MOUNT_POINT = "/data" }
+
+# 無論前面步驟是否失敗，最後一律執行
+[cleanup]
+id = "remover"
+name = "清理暫存腳本與安裝檔 (remover.sh)"
+script = "remover.sh"
+sudo = true

@@ -1,0 +1,91 @@
+# ════════════════════════════════════════════════════════════════
+# VM 開立規則 (Policy) 範本
+# 使用方式：複製為 policies/vm_defaults.toml 後填入貴單位的實際值。
+#           vm_defaults.toml 含內部資訊，已列入 .gitignore；
+#           若找不到 vm_defaults.toml，程式會退回讀取本範本。
+# ════════════════════════════════════════════════════════════════
+
+# 使用者未指定時套用的預設值
+[defaults]
+ip_mode = "DHCP"
+cluster = "cluster-01"
+datastore = "datastore-hdd"
+sg = "ap"
+os_owner = "Default_OS_Owner"
+# 僅在已填 ap_owner 但未填 ap_unit 時套用
+ap_unit = "Default_AP_Unit"
+
+# 數值上下限 (會套用到 Pydantic 驗證)
+[limits]
+cpu_min = 1
+cpu_max = 128
+memory_mb_min = 1
+memory_mb_max = 65536
+
+# 可用的存儲位置，以及依存儲類型 (HDD / SSD) 自動選擇的對應
+[datastore]
+allowed = ["datastore-hdd", "datastore-ssd"]
+
+[datastore.by_storage_type]
+HDD = "datastore-hdd"
+SSD = "datastore-ssd"
+
+# 可用的 NSX-T 安全群組
+[security_group]
+allowed = ["ap", "db", "web"]
+
+# 未指定 deployment_name 時自動命名：{prefix}-{SG}-{4 位數字}
+[deployment_name]
+fallback_prefix = "vm"
+
+# 專案 description 欄位自動帶入規則，例如 "C25033100002/王小明/HR Dashboard"
+[project_description]
+separator = "/"
+fields = ["case_no", "ap_owner", "description"]
+
+# ─── 網段：依專案名稱決定 ───
+[network]
+default = "NET_DEFAULT"
+
+# 專案名稱完全符合
+[network.by_project]
+"proj-demo" = "NET_A01"
+
+# 專案名稱前綴 (不分大小寫)，依序比對
+[[network.by_prefix]]
+prefix = "a-"
+segment = "NET_A02"
+
+# ─── 藍圖：依 OS Image 名稱選擇藍圖搜尋關鍵字 ───
+[blueprint]
+# 無法判斷時的搜尋關鍵字
+default_query = "Windows"
+# 搜尋結果中名稱包含此字串者優先
+preferred_keyword = "v2.0"
+
+# 依序比對 (OS Image 名稱轉小寫後)：prefix = 開頭符合；contains = 包含
+[[blueprint.os_rules]]
+prefix = "win"
+query = "Windows"
+
+[[blueprint.os_rules]]
+contains = "ubuntu"
+query = "Ubuntu"
+
+# ─── OS Image：自然語言 → image-profiles 名稱 ───
+# keywords 任一出現在需求中即命中該家族；versions 依序比對 match 字串；
+# image_eng 為選填，需求中含 eng / english / en 時使用。
+[[os_images.families]]
+keywords = ["win"]
+default = "win2022-cht"
+default_eng = "win2022-eng"
+versions = [
+    { match = "2019", image = "win2019-cht", image_eng = "win2019-eng" },
+]
+
+[[os_images.families]]
+keywords = ["ubuntu"]
+default = "ubuntu2404"
+versions = [
+    { match = "22", image = "ubuntu2204" },
+]

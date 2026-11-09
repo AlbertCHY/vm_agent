@@ -5,8 +5,7 @@ __pycache__/
 .pytest_cache/
 
 # 執行期資料 (工單、密碼紀錄、checkpoint 資料庫)
-tickets/*
-!tickets/.gitkeep
+tickets/
 logs/
 data/
 

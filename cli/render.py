@@ -88,5 +88,5 @@ def print_tool_result(msg: ToolMessage) -> None:
     except (json.JSONDecodeError, TypeError):
         preview = " ".join(text.split())
     style = "red" if text.lstrip().startswith("❌") or "[status=failed]" in text else "dim"
-    console.print(f"[{style}]  ↳ {name}: {escape(preview[:160])}{'…' if len(preview) > 160 else ''}[/{style}]",
+    console.print(f"[{style}]  ↳ {name}: {escape(preview[:500])}{'…' if len(preview) > 500 else ''}[/{style}]",
                   highlight=False)

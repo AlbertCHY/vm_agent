@@ -27,13 +27,23 @@ def _display_value(field: dict[str, Any]) -> str:
 
 
 def render_request(request: dict[str, Any]) -> None:
+    fields = request.get("fields") or []
+    has_source = any(f.get("source") for f in fields)
     table = Table(title=request.get("title") or "待審核項目", show_header=True, header_style="bold magenta")
-    table.add_column("參數名稱 (Key)", style="cyan", width=20)
-    table.add_column("說明", style="dim", width=30)
-    table.add_column("設定值 (Value)", style="bold green", width=46)
-    for f in request.get("fields") or []:
+    table.add_column("參數名稱 (Key)", style="cyan", width=18)
+    table.add_column("說明", style="dim", width=26)
+    table.add_column("設定值 (Value)", style="bold green", width=40)
+    if has_source:
+        table.add_column("來源", style="yellow", width=12)
+    for f in fields:
         key = f.get("key", "")
-        table.add_row(key + ("" if f.get("editable", True) else " 🔒"), escape(str(f.get("label", ""))), _display_value(f))
+        label = escape(str(f.get("label", "")))
+        if f.get("options"):
+            label += f"\n[dim italic]可選：{escape(str(f['options']))}[/dim italic]"
+        row = [key + ("" if f.get("editable", True) else " 🔒"), label, _display_value(f)]
+        if has_source:
+            row.append(escape(str(f.get("source") or "")))
+        table.add_row(*row)
     console.print(table)
 
     for note in request.get("notes") or []:

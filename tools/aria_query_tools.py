@@ -6,7 +6,7 @@ from typing import Any
 import requests
 from langchain_core.tools import tool
 
-from clients.aria_client import get_aria_client
+from clients.aria import get_aria_client
 
 
 def _dump(data: Any) -> str:

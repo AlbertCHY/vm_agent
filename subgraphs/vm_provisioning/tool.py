@@ -36,7 +36,7 @@ def _summarize(session_id: str, values: dict[str, Any]) -> PipelineResult:
         status = "aborted"
     elif exec_res and exec_res.get("error"):
         status = "failed"
-    elif values.get("missing_fields") and not exec_res:
+    elif values.get("missing") and not exec_res:
         status = "needs_clarification"
     else:
         status = "incomplete"
@@ -45,9 +45,12 @@ def _summarize(session_id: str, values: dict[str, Any]) -> PipelineResult:
         session_id=session_id,
         message=last_ai_text(values),
         data={
-            "spec": values.get("current_spec") or {},
-            "missing_fields": values.get("missing_fields") or [],
+            "project": values.get("project"),
+            "template": values.get("template"),
+            "values": values.get("values") or {},
+            "missing": values.get("missing") or [],
             "execution_result": exec_res,
+            "_intent": values.get("intent") or {},
             "_messages": values.get("messages", []),
         },
     )
@@ -55,7 +58,7 @@ def _summarize(session_id: str, values: dict[str, Any]) -> PipelineResult:
 
 def run_vm_pipeline(requirement_description: str, session_id: Optional[str] = None,
                     tool_call_id: Optional[str] = None) -> PipelineResult:
-    """執行一次 VM 開機子圖並回傳結構化結果"""
+    """執行一次 VM 開機申請子圖並回傳結構化結果"""
     store = get_app_store()
     sid = session_id or derive_session_id("vmprov", tool_call_id)
     prior = store.load_pipeline(sid) if session_id else None
@@ -63,21 +66,24 @@ def run_vm_pipeline(requirement_description: str, session_id: Optional[str] = No
 
     graph_input = {
         "messages": prior_messages + [HumanMessage(content=requirement_description)],
-        "current_spec": (prior or {}).get("spec") or {},
-        "missing_fields": [],
+        "intent": (prior or {}).get("intent") or {},
+        "overrides": {},
+        "choices": {},
+        "notes": [],
+        "errors": [],
+        "missing": [],
+        "reviewed": False,
+        "submit_after_validate": False,
         "human_feedback": None,
-        "validation_errors": [],
         "execution_result": None,
     }
-    result = run_pipeline("VM 開機", sid, get_vm_provisioning_graph(), graph_input,
+    result = run_pipeline("VM 開機申請", sid, get_vm_provisioning_graph(), graph_input,
                           lambda values: _summarize(sid, values))
 
     messages = result.data.pop("_messages", [])
+    intent = result.data.pop("_intent", {})
     if result.status == "needs_clarification":
-        store.save_pipeline(sid, PIPELINE_KIND, {
-            "spec": result.data.get("spec") or {},
-            "messages": messages_to_dict(messages),
-        })
+        store.save_pipeline(sid, PIPELINE_KIND, {"intent": intent, "messages": messages_to_dict(messages)})
     else:
         store.delete_pipeline(sid)
     return result
@@ -90,7 +96,7 @@ def deploy_vm_pipeline(
     tool_call_id: Annotated[Optional[str], InjectedToolCallId] = None,
 ) -> tuple[str, dict[str, Any]]:
     """
-    【僅限開立 VM】傳入單一 VM 的完整需求描述，啟動 16 欄位自動補齊、人工審查 (HITL) 與 Aria 提交流程。
+    【僅限開立 VM】傳入單一 VM 的完整需求描述，依 Aria Service Broker catalog 模板的表單組合申請內容，經人工審查 (HITL) 後送出申請。
     一次只處理一台 VM；多台 VM 請依序逐台呼叫，不要同時平行呼叫。
     回傳 status：submitted (已送出) / needs_clarification (缺欄位，需轉問使用者) / aborted (使用者取消) / failed / incomplete。
     參數 requirement_description: 單一 VM 的自然語言需求 (專案、作業系統、VM 名稱、單號、CPU、記憶體、負責人、單位、用途等)。

@@ -1,305 +1,294 @@
-"""VM Provisioning 子圖節點
+"""VM Provisioning 子圖節點 (模仿 Service Broker > Catalog 的手動申請流程)
 
-節點：analyze_and_extract → check_completeness → (ask_clarification | human_review) → submit_request
-業務預設值與對應規則來自 policies/vm_defaults.toml (core.policy.VMPolicy)。
+parse_intent → select_template → load_form → resolve_fields → validate
+  → (ask_clarification | human_review | submit_request)
+
+- 欄位、選項、必填來自 Aria catalog schema + Custom Form (clients.aria.forms)。
+- LLM 只做兩件事：抽取意圖、從真實候選中選擇 (模板、OS image)。
+- 其餘由程式確定性處理 (專案 ID、CPU / 記憶體、網段、Datastore、流水號)。
 """
-import time
+import json
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END
 
 import config
-from clients.aria_client import get_aria_client
-from clients.llm import get_llm
+from clients.aria import get_aria_client
+from clients.aria.models import FormField
 from core.policy import get_vm_policy
 from core.progress import emit
 from core.secrets import get_audit_sink
-from schemas import (
-    CRITICAL_FIELDS,
-    INT_FIELDS,
-    REQUIRED_FIELDS,
-    VM_FIELDS,
-    VMDeploymentParams,
-    field_label,
-    validate_vm_spec,
+from subgraphs.common.review import APPROVE, EDIT, REJECT, SKIP, ReviewField, ask_review, review_request
+from subgraphs.vm_provisioning import reasoning
+from subgraphs.vm_provisioning.resolver import (
+    DEPLOYMENT_NAME, OS_IMAGE, display_value, resolve_values, validate_values,
 )
-from subgraphs.common.review import (
-    APPROVE, EDIT, REJECT, SKIP, ReviewField, ask_review, review_request,
-)
-from subgraphs.vm_provisioning.state import ProvisioningState, SpecExtractionResult
+from subgraphs.vm_provisioning.state import ProvisioningState
 
 PROMPTS = config.PROMPTS
 
 
-def _policy_hint() -> str:
-    """把 policy 中的可選值提供給 LLM 參考 (選項來源唯一：policies/vm_defaults.toml)"""
-    p = get_vm_policy()
-    mapping = ", ".join(f"{k} → {v}" for k, v in p.datastore_by_storage_type.items())
-    return (
-        f"【安全群組 sg 可選值】: {', '.join(p.sg_allowed)}\n"
-        f"【存儲位置 datastore 可選值】: {', '.join(p.datastore_allowed)}"
-        + (f" (依存儲類型：{mapping})" if mapping else "")
-    )
+def _fields(state: ProvisioningState) -> list[FormField]:
+    return [FormField.model_validate(f) for f in state.get("fields") or []]
 
 
-def _safe_available_images() -> dict[str, Any]:
-    try:
-        return get_aria_client().get_os_images()
-    except Exception:
-        return {}
+def _context(state: ProvisioningState) -> str:
+    """提供給 choose() 的需求內容：累積意圖 + 審核退回意見"""
+    intent = state.get("intent") or {}
+    feedback = [m.content for m in state.get("messages", []) if isinstance(m, HumanMessage)
+                and str(m.content).startswith("人工審查已退回")]
+    ctx = json.dumps({k: v for k, v in intent.items() if v not in (None, "")}, ensure_ascii=False)
+    return ctx + ("\n" + "\n".join(feedback[-2:]) if feedback else "")
 
 
-# 1. 意圖分析與規格抽取節點
-def analyze_and_extract(state: ProvisioningState) -> dict[str, Any]:
-    """使用 LLM 結構化輸出解析使用者自然語言，並透過 API 查詢補齊 project_id、os_image (image-profiles) 與 blueprint_id"""
-    messages = state.get("messages", [])
-    current_spec = dict(state.get("current_spec") or {})
+# 1. 意圖抽取
+def parse_intent(state: ProvisioningState) -> dict[str, Any]:
+    emit("[VM Provisioning] 正在分析需求敘述...", stage="vm_provisioning")
+    intent = reasoning.parse_intent(state.get("messages", []), state.get("intent") or {})
+    return {"intent": intent}
+
+
+# 2. 專案與模板
+def select_template(state: ProvisioningState) -> dict[str, Any]:
+    aria = get_aria_client()
+    intent = state.get("intent") or {}
+    overrides = state.get("overrides") or {}
+    choices = dict(state.get("choices") or {})
+    notes: list[str] = []
+    errors: list[str] = []
+
+    project = None
+    query = overrides.get("project") or intent.get("project")
+    if query:
+        hits = aria.iaas.find_projects(query)
+        if hits:
+            project = hits[0]
+            if len(hits) > 1:
+                notes.append(f"專案「{query}」有多個相符：{', '.join(h['name'] for h in hits)}；已選 {project['name']}")
+        else:
+            errors.append(f"找不到專案「{query}」")
+
+    template = None
+    if project:
+        items = aria.catalog.list_items(project["id"])
+        wanted = overrides.get("template")
+        if wanted:
+            matched = [it for it in items if wanted.lower() in it.name.lower() or it.id == wanted]
+            if matched:
+                template = {"id": matched[0].id, "name": matched[0].name}
+            else:
+                errors.append(f"專案 {project['name']} 沒有名稱包含「{wanted}」的模板")
+        elif intent.get("os_family") or intent.get("os_version"):
+            emit("[VM Provisioning] 正在選擇 catalog 模板...", stage="vm_provisioning")
+            name, reason = reasoning.choose(
+                "template", [(it.name, it.description) for it in items],
+                PROMPTS["vm_choice"]["template"], _context(state), choices,
+            )
+            hit = next((it for it in items if it.name == name), None)
+            if hit:
+                template = {"id": hit.id, "name": hit.name}
+                if reason and reason != "唯一選項":
+                    notes.append(f"模板選擇理由：{reason}")
+        if not items:
+            errors.append(f"專案 {project['name']} 沒有可申請的 catalog 模板")
+
+    return {"project": project, "template": template, "choices": choices,
+            "notes": notes, "errors": errors}
+
+
+# 3. 模板表單
+def load_form(state: ProvisioningState) -> dict[str, Any]:
+    template = state.get("template")
+    if not template:
+        return {"fields": []}
+    aria = get_aria_client()
+    version = aria.catalog.get_version(template["id"])
+    fields = aria.forms.fields_for(version)
+    return {"template": {**template, "version": version.version},
+            "fields": [f.model_dump() for f in fields]}
+
+
+# 4. 欄位解析
+def resolve_fields(state: ProvisioningState) -> dict[str, Any]:
     aria = get_aria_client()
     policy = get_vm_policy()
+    project = state.get("project")
+    choices = dict(state.get("choices") or {})
+    fields = _fields(state)
 
-    # 取得系統中所有可用的 OS Image 映射清單 (來自 /iaas/api/image-profiles)
-    available_images = _safe_available_images()
-    image_keys_str = ", ".join(available_images.keys()) if available_images else "無"
+    def choose_os_image(field: FormField) -> tuple[Any, str]:
+        excluded = {x.lower() for x in policy.exclude_os_options}
+        candidates = [(str(o.value), o.label) for o in field.options or [] if str(o.value).lower() not in excluded]
+        try:
+            images = aria.iaas.get_images()
+        except Exception:
+            images = {}
+        known = {c[0] for c in candidates}
+        candidates += [(k, f"image profile: {info.get('description') or info.get('name') or k}")
+                       for k, info in sorted(images.items()) if k not in known and k.lower() not in excluded]
+        return reasoning.choose("os_image", candidates, PROMPTS["vm_choice"]["os_image"], _context(state), choices)
 
-    system_instruction = (
-        f"{PROMPTS['vm_agent']['system']}\n\n"
-        f"{PROMPTS['extractor']['system']}\n\n"
-        f"【系統目前支援的 OS Image 映像檔名稱清單 (image-profiles)】:\n{image_keys_str}\n\n"
-        f"注意：os_image 必須為上述清單中的具體名稱。\n\n"
-        f"{_policy_hint()}\n\n"
-        f"目前已知/已累積的規格參數: {current_spec}"
+    def next_serial(prefix: str) -> int:
+        return aria.deployments.next_serial(project["id"], prefix) if project else 1
+
+    values, sources, notes, errors = resolve_values(
+        state.get("intent") or {}, project, fields, state.get("overrides") or {},
+        policy, choose_os_image, next_serial,
     )
-
-    structured_llm = get_llm().with_structured_output(SpecExtractionResult)
-
-    emit("[VM Provisioning] 正在分析需求並抽取規格參數...", stage="vm_provisioning")
-    prompt_messages = [SystemMessage(content=system_instruction)] + messages
-    result: SpecExtractionResult = structured_llm.invoke(prompt_messages)
-
-    # 合併提取到的新欄位
-    extracted_dict = result.extracted_spec.model_dump(exclude_none=True)
-    current_spec.update(extracted_dict)
-
-    # 1.1 若需要查詢專案 ID
-    if result.project_name_query and not current_spec.get("project_id"):
-        projects = aria.get_projects(name_filter=result.project_name_query)
-        if projects:
-            matched_proj = projects[0]
-            current_spec["project_id"] = matched_proj["id"]
-            current_spec["project_name"] = matched_proj["name"]
-            # 依 policy 從專案 description (例如 '單號/負責人/用途') 自動輔助填補
-            for key, val in policy.fields_from_project_description(matched_proj.get("description", "")).items():
-                if not current_spec.get(key):
-                    current_spec[key] = val
-
-    if current_spec.get("project_id") and not current_spec.get("project_name"):
-        current_spec["project_name"] = aria.get_project_name(current_spec["project_id"])
-
-    # 1.2 處理 OS Image (從 image-profiles 選取) 與 藍圖 ID
-    os_query = result.blueprint_os_query or current_spec.get("os_image")
-    if available_images and current_spec.get("os_image") not in available_images and os_query:
-        matched_img = policy.match_os_image(os_query, available_images)
-        if matched_img:
-            current_spec["os_image"] = matched_img
-
-    if not current_spec.get("blueprint_id"):
-        bp_query = policy.blueprint_query_for(current_spec.get("os_image"), os_query)
-        selected_bp = policy.pick_blueprint(aria.get_blueprints(os_hint=bp_query))
-        if selected_bp:
-            current_spec["blueprint_id"] = selected_bp["id"]
-            current_spec["blueprint_name"] = selected_bp["name"]
-
-    if current_spec.get("blueprint_id") and not current_spec.get("blueprint_name"):
-        current_spec["blueprint_name"] = aria.get_blueprint_name(current_spec["blueprint_id"])
-
-    # 1.3 存儲類型 → datastore (policy 對應)
-    if not current_spec.get("datastore") and result.storage_type:
-        ds = policy.datastore_for_storage_type(result.storage_type)
-        if ds:
-            current_spec["datastore"] = ds
-
-    # 1.4 補足常規基礎預設值 (若尚未設定)
-    current_spec = policy.apply_defaults(current_spec)
-
-    # 若未指定 deployment_name，自動生成一個易辨識的名稱
-    if not current_spec.get("deployment_name"):
-        base_name = (result.project_name_query or policy.deployment_name_prefix).lower()
-        suffix = int(time.time()) % 10000
-        sg_tag = str(current_spec.get("sg", "ap")).upper()
-        current_spec["deployment_name"] = f"{base_name}-{sg_tag}-{suffix:04d}"
-
     return {
-        "current_spec": current_spec,
-        "action_type": result.action_type,
-        "validation_errors": [],
+        "values": values, "sources": sources, "choices": choices,
+        "notes": (state.get("notes") or []) + notes,
+        "errors": (state.get("errors") or []) + errors,
     }
 
 
-# 2. 完整性檢查與路由節點
-def check_completeness(state: ProvisioningState) -> dict[str, Any]:
-    """檢查必填欄位是否完整"""
-    current_spec = state.get("current_spec") or {}
-    missing = [f for f in REQUIRED_FIELDS if not current_spec.get(f)]
-    return {"missing_fields": missing}
+# 5. 驗證與路由
+def validate(state: ProvisioningState) -> dict[str, Any]:
+    fields = _fields(state)
+    values = state.get("values") or {}
+    missing: list[str] = []
+    if not state.get("project"):
+        missing.append("Aria 專案名稱")
+    if not state.get("template"):
+        missing.append("作業系統 (用於選擇 catalog 模板)")
+    if fields:
+        m, errs, notes = validate_values(fields, values, get_aria_client().iaas.find_machines_by_ip)
+        missing += m
+    else:
+        errs, notes = [], []
+    return {"missing": missing,
+            "errors": (state.get("errors") or []) + errs,
+            "notes": (state.get("notes") or []) + notes}
 
 
-def route_completeness(state: ProvisioningState) -> str:
-    """若有核心欄位缺失則發問，齊全則進入人工審查"""
-    missing = state.get("missing_fields", [])
-    if any(f in CRITICAL_FIELDS for f in missing):
+def route_validate(state: ProvisioningState) -> str:
+    problems = state.get("missing") or state.get("errors")
+    if not state.get("reviewed") and state.get("missing"):
         return "ask_clarification"
+    if state.get("submit_after_validate") and not problems:
+        return "submit_request"
     return "human_review"
 
 
-# 3. 補充詢問節點
+# 6. 補問
 def ask_clarification(state: ProvisioningState) -> dict[str, Any]:
-    """向使用者詢問缺少的必要資訊"""
-    missing = state.get("missing_fields", [])
-    missing_text = "\n".join(f"- {field_label(f)}" for f in missing)
-    msg = PROMPTS["clarification"]["reply"].format(missing_fields_text=missing_text)
+    lines = [f"- {m}" for m in state.get("missing") or []] + [f"- ⚠️ {e}" for e in state.get("errors") or []]
+    msg = PROMPTS["clarification"]["reply"].format(missing_fields_text="\n".join(lines))
     return {"messages": [AIMessage(content=msg)]}
 
 
-# ─── 人工審核：修改內容的解析 (UI 只傳原始字串，所有轉型 / 名稱解析都在這裡) ───
-def apply_edits(spec: dict[str, Any], edits: dict[str, str]) -> tuple[dict[str, Any], list[str]]:
-    new_spec = dict(spec)
-    errors: list[str] = []
-    aria = get_aria_client()
-    policy = get_vm_policy()
-
-    for key, raw in (edits or {}).items():
-        val = (raw or "").strip()
-        if key in ("project", "project_name", "project_id"):
-            resolved = aria.resolve_project(val)
-            if resolved:
-                new_spec["project_id"], new_spec["project_name"] = resolved["id"], resolved["name"]
-                if "network_segment" not in edits:
-                    new_spec["network_segment"] = policy.network_segment_for(resolved["name"])
-            else:
-                errors.append(f"找不到專案「{val}」")
-        elif key in ("blueprint", "blueprint_name", "blueprint_id"):
-            resolved = aria.resolve_blueprint(val)
-            if resolved:
-                new_spec["blueprint_id"], new_spec["blueprint_name"] = resolved["id"], resolved["name"]
-            else:
-                errors.append(f"找不到藍圖「{val}」")
-        elif key == "os_image":
-            new_spec["os_image"] = policy.match_os_image(val, _safe_available_images()) or val
-        elif key in INT_FIELDS:
-            try:
-                new_spec[key] = int(val)
-            except ValueError:
-                errors.append(f"{field_label(key, with_hint=False)} [{key}] 必須是整數：{val}")
-        elif key == "ip_mode":
-            new_spec[key] = val.upper()
-        elif key in VM_FIELDS:
-            new_spec[key] = val
-        else:
-            errors.append(f"未知的欄位：{key}")
-    return new_spec, errors
-
-
-def _enrich_names(spec: dict[str, Any]) -> dict[str, Any]:
-    spec = dict(spec)
-    aria = get_aria_client()
-    if spec.get("project_id") and not spec.get("project_name"):
-        spec["project_name"] = aria.get_project_name(spec["project_id"])
-    if spec.get("blueprint_id") and not spec.get("blueprint_name"):
-        spec["blueprint_name"] = aria.get_blueprint_name(spec["blueprint_id"])
-    return spec
-
-
-def build_review_fields(spec: dict[str, Any]) -> list[ReviewField]:
-    rows: list[ReviewField] = []
-    for key in REQUIRED_FIELDS:
-        if key == "project_id":
-            rows.append(ReviewField(key="project", label=field_label("project_name", False),
-                                    value=spec.get("project_name") or spec.get("project_id"), editable=True))
-        elif key == "blueprint_id":
-            rows.append(ReviewField(key="blueprint", label=field_label("blueprint_name", False),
-                                    value=spec.get("blueprint_name") or spec.get("blueprint_id"), editable=True))
-        else:
-            rows.append(ReviewField(key=key, label=field_label(key), value=spec.get(key), editable=True))
+# 7. 人工審核
+def build_review_fields(state: ProvisioningState) -> list[ReviewField]:
+    values = state.get("values") or {}
+    sources = state.get("sources") or {}
+    project = state.get("project") or {}
+    template = state.get("template") or {}
+    rows: list[ReviewField] = [
+        ReviewField(key="project", label="專案", value=project.get("name"), editable=True,
+                    source="Aria 查詢" if project else ""),
+        ReviewField(key="template", label="Catalog 模板",
+                    value=f"{template.get('name')} (v{template.get('version')})" if template else None,
+                    editable=True, source="模型選擇" if template and "template" in (state.get("choices") or {}) else ""),
+        ReviewField(key=DEPLOYMENT_NAME, label="部署名稱", value=values.get(DEPLOYMENT_NAME), editable=True,
+                    source=sources.get(DEPLOYMENT_NAME, "")),
+    ]
+    for f in _fields(state):
+        if not f.submit or not f.is_visible(values):
+            continue
+        options = ""
+        if f.options:
+            shown = [o.label for o in f.options]
+            options = " / ".join(shown[:10]) + (" …" if len(shown) > 10 else "")
+        rows.append(ReviewField(
+            key=f.id, label=f.label + (" *" if f.required else ""), value=display_value(f, values.get(f.id)),
+            editable=True, source=sources.get(f.id, ""), options=options,
+        ))
     return rows
 
 
-# 4. 人工審核中斷節點 (HITL)
 def human_review(state: ProvisioningState) -> dict[str, Any]:
-    """觸發中斷等待人工審查 (送出前已先做 Pydantic 驗證)，支援核准、修改參數、退回或取消"""
-    spec = _enrich_names(state.get("current_spec") or {})
-    errors = state.get("validation_errors") or validate_vm_spec(spec)
-
+    errors = list(state.get("errors") or []) + [f"缺少：{m}" for m in state.get("missing") or []]
     decision = ask_review(review_request(
         kind="vm_deployment",
-        title="📋 待審核的虛擬機規格參數清單",
-        message="VM 部署規格已組合完成，請人工審查確認。" + ("（目前規格有錯誤，請以 E 修正或退回）" if errors else ""),
-        fields=build_review_fields(spec),
+        title="📋 待審核的 VM 開機申請 (Service Broker Catalog)",
+        message="VM 申請內容已組合完成，請人工審查確認。" + ("（目前有錯誤或缺漏，請以 E 修正或退回）" if errors else ""),
+        fields=build_review_fields(state),
         actions=[APPROVE, EDIT, REJECT, SKIP],
         errors=errors,
+        notes=state.get("notes") or [],
     ))
     feedback = decision.model_dump()
+    base = {"human_feedback": feedback, "reviewed": True, "notes": [], "errors": []}
 
     if decision.action in ("approve", "edit"):
-        new_spec, edit_errors = apply_edits(spec, decision.edits) if decision.edits else (spec, [])
-        all_errors = edit_errors + validate_vm_spec(new_spec)
-        return {"current_spec": new_spec, "human_feedback": feedback, "validation_errors": all_errors}
+        overrides = {**(state.get("overrides") or {}), **decision.edits}
+        if decision.action == "approve" and not decision.edits:
+            problems = bool(errors)
+            return {**base, "errors": state.get("errors") or [], "notes": state.get("notes") or [],
+                    "submit_after_validate": not problems}
+        return {**base, "overrides": overrides, "submit_after_validate": True}
 
     if decision.action == "skip":
         reason = decision.feedback
         return {
-            "current_spec": spec,
-            "human_feedback": feedback,
-            "validation_errors": [],
+            **base,
             "execution_result": {"aborted": True, "reason": reason or "使用者於人工審查取消"},
-            "messages": [AIMessage(content=f"🚫 已取消此 VM 部署。{('原因: ' + reason) if reason else ''}")],
+            "messages": [AIMessage(content=f"🚫 已取消此 VM 申請。{('原因: ' + reason) if reason else ''}")],
         }
 
-    # reject：帶著意見回到 analyze 重新推論
+    # reject：帶意見重新抽取意圖，並清除模型的選擇快取
     return {
-        "current_spec": spec,
-        "human_feedback": feedback,
-        "validation_errors": [],
+        **base,
+        "choices": {},
+        "submit_after_validate": False,
         "messages": [HumanMessage(content=f"人工審查已退回，意見為: {decision.feedback or '請調整規格'}")],
     }
 
 
-def route_review_result(state: ProvisioningState) -> str:
-    """根據人工審查結果路由"""
-    fb = state.get("human_feedback") or {}
-    action = fb.get("action")
-    if action in ("approve", "edit"):
-        return "human_review" if state.get("validation_errors") else "submit_request"
+def route_review(state: ProvisioningState) -> str:
+    action = (state.get("human_feedback") or {}).get("action")
     if action == "skip":
         return END
-    return "analyze_and_extract"
+    if action == "reject":
+        return "parse_intent"
+    if action == "approve" and state.get("submit_after_validate"):
+        return "submit_request"
+    if action == "approve":
+        return "human_review"          # 仍有錯誤，不能送出
+    return "select_template"           # edit：重新解析 (修改值最後套用)
 
 
-# 5. 提交請求節點
+# 8. 送出 catalog request
 def submit_request(state: ProvisioningState) -> dict[str, Any]:
-    """將驗證後的規格轉為 API 請求並送出至 Aria Automation"""
-    spec = state.get("current_spec") or {}
-    emit("[VM Provisioning] 正在送出 Aria Automation 部署請求...", stage="vm_provisioning")
-
+    emit("[VM Provisioning] 正在送出 Service Broker catalog 申請...", stage="vm_provisioning")
+    project = state["project"]
+    template = state["template"]
+    values = state.get("values") or {}
+    inputs = {f.id: values[f.id] for f in _fields(state) if f.submit and f.id in values and values[f.id] is not None}
+    deployment_name = values[DEPLOYMENT_NAME]
     try:
-        validated_params = VMDeploymentParams(**spec)
-        payload = validated_params.to_aria_request_payload()
-        result = get_aria_client().submit_blueprint_request(payload)
-        get_audit_sink().record("vm_deployment_submitted", spec=spec, result=result)
-
-        msg = (
-            f"🎉 **VM 部署請求已成功送出！**\n\n"
-            f"- **部署名稱**: `{result.get('deployment_name')}`\n"
-            f"- **請求編號 (Request ID)**: `{result.get('request_id')}`\n"
-            f"- **部署編號 (Deployment ID)**: `{result.get('deployment_id')}`\n"
-            f"- **狀態**: `{result.get('status')}`\n"
-            f"- **建立時間**: `{result.get('created_at')}`\n\n"
-            f"Aria Automation 已開始在背景建立該虛擬機，您可以登入主控台查看進度。"
+        result = get_aria_client().catalog.submit_request(
+            template["id"], project["id"], deployment_name, template["version"], inputs,
+            reason=str(values.get("Description") or ""),
         )
-        return {"execution_result": result, "messages": [AIMessage(content=msg)]}
-    except Exception as e:
-        get_audit_sink().record("vm_deployment_failed", spec=spec, error=str(e))
-        return {
-            "execution_result": {"error": str(e)},
-            "messages": [AIMessage(content=f"❌ 送出部署請求失敗: {e}")],
+        exec_res = {
+            "success": True,
+            "deployment_id": result.deployment_id,
+            "deployment_name": result.deployment_name or deployment_name,
+            "project": project, "template": template, "inputs": inputs,
         }
+        get_audit_sink().record("vm_deployment_submitted", **exec_res)
+        msg = (
+            f"🎉 **VM 申請已送出！**\n\n"
+            f"- **部署名稱**: `{exec_res['deployment_name']}`\n"
+            f"- **Deployment ID**: `{result.deployment_id}`\n"
+            f"- **模板**: {template['name']} (v{template['version']})\n"
+            f"- **專案**: {project['name']}\n\n"
+            "申請會先經過 Aria 上的審核，核准後開始建立虛擬機。"
+        )
+        return {"execution_result": exec_res, "messages": [AIMessage(content=msg)]}
+    except Exception as e:
+        get_audit_sink().record("vm_deployment_failed", inputs=inputs, error=str(e))
+        return {"execution_result": {"error": str(e)},
+                "messages": [AIMessage(content=f"❌ 送出 catalog 申請失敗: {e}")]}

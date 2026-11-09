@@ -20,6 +20,8 @@ class ReviewField(TypedDict, total=False):
     label: str
     value: Any
     editable: bool
+    source: str            # 值的來源 (需求敘述 / 模型選擇 / Aria 查詢 / 預設…)，供審核判斷
+    options: str           # 可選項提示 (例如表單下拉選項)
     # 機密欄位：value 不放明文，改放 secret_ref + secret_key，由介面層從 SecretStore 取值顯示
     secret_ref: str
     secret_key: str

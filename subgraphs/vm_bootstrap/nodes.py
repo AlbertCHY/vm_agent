@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage
 from langgraph.graph import END
 
 import config
-from clients.aria_client import get_aria_client
+from clients.aria import get_aria_client
 from clients.ssh_client import get_ssh_client
 from core.progress import emit
 from core.secrets import get_audit_sink, get_credential_sink, get_secret_store

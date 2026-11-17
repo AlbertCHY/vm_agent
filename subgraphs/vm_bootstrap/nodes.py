@@ -334,9 +334,9 @@ def run_step(state: BootstrapState) -> dict[str, Any]:
         results.append({"step": name, "status": "skipped", "exit_code": 0, "detail": "依設定略過"})
         return {**updates, "step_results": results}
 
-    if step.secret_env and _secrets(state) is None:
+    if step.rotates_password and _secrets(state) is None:
         results.append({"step": name, "status": "failed", "exit_code": -1,
-                        "detail": "本機記憶體中的密碼已遺失 (程式可能已重啟)，無法續跑"})
+                        "detail": "本機記憶體中的密碼已遺失 (程式可能已重啟)，無法執行改密碼步驟"})
         return {**updates, "step_results": results, "stopped": True}
 
     emit(f"[Bootstrap] ▶ 執行 {name} ...", stage="vm_bootstrap", step=step.id)
@@ -417,7 +417,8 @@ def finalize(state: BootstrapState) -> dict[str, Any]:
         "（為保護資安，不在雲端對話中重複顯示明文密碼）。",
     ])
 
-    get_secret_store().delete(state.get("secret_ref"))
+    if overall_ok:
+        get_secret_store().delete(state.get("secret_ref"))
     get_audit_sink().record("vm_bootstrap_finished", ip=ip, hostname=hostname, success=overall_ok)
     return {
         "execution_result": {

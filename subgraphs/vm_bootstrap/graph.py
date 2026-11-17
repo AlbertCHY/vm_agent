@@ -19,7 +19,9 @@ from subgraphs.vm_bootstrap.nodes import (
 from subgraphs.vm_bootstrap.state import BootstrapState
 
 
-def build_vm_bootstrap_graph():
+def build_vm_bootstrap_graph(checkpointer=None):
+    """checkpointer=None：嵌在 Supervisor 工具內執行 (沿用 Supervisor 的 checkpointer)；
+    追蹤工作 (/jobs) 獨立執行時傳入持久化 checkpointer"""
     builder = StateGraph(BootstrapState)
 
     builder.add_node("prepare_bootstrap", prepare_bootstrap)
@@ -48,4 +50,4 @@ def build_vm_bootstrap_graph():
     builder.add_edge("cleanup", "finalize")
     builder.add_edge("finalize", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)

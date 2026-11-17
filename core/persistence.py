@@ -1,12 +1,13 @@
-"""持久化：LangGraph checkpointer (SQLite) 與輕量的對話 / 流程 Session 紀錄
+"""持久化：LangGraph checkpointer (SQLite)、單一實例鎖與輕量的對話 / 流程 Session 紀錄
 
-- checkpoints.sqlite：LangGraph 的 SqliteSaver，Supervisor 與其內嵌子圖共用，
+- checkpoints.sqlite：LangGraph 的 SqliteSaver，Supervisor 與所有業務子圖 (含 VM 生命週期子圖) 共用，
   中斷 (interrupt) 等待審核或程式異常結束後，都能以相同 thread_id 繼續。
 - app.sqlite：
-    * sessions           — 對話 Session 清單 (供 /pending 列出可續跑的流程)
+    * sessions           — 對話與 VM 生命週期子圖的 Session 索引 (thread_id、標題、類型、封存狀態)
     * pipeline_sessions  — 子圖跨次呼叫需延續的資料 (例如 VM 開立補問欄位時暫存已解析規格)
 """
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -16,6 +17,37 @@ from typing import Any, Optional
 
 import config
 
+_LOCK_FILE_HANDLE = None
+
+
+def acquire_background_lock() -> bool:
+    """
+    取得跨行程背景輪詢鎖 (data/watcher.lock)。
+    防止同時開啟多個 CLI 視窗時重複啟動背景輪詢或重複送出硬碟動作；行程結束時由作業系統自動釋放。
+    """
+    global _LOCK_FILE_HANDLE
+    if _LOCK_FILE_HANDLE is not None:
+        return True
+    lock_path = config.DATA_DIR / "watcher.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fh = open(lock_path, "a+b")
+        fh.seek(0)
+        if fh.tell() == 0:
+            fh.write(b"0")
+            fh.flush()
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _LOCK_FILE_HANDLE = fh
+        return True
+    except OSError:
+        return False
+
 
 @lru_cache(maxsize=1)
 def get_checkpointer():
@@ -24,6 +56,27 @@ def get_checkpointer():
     config.CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(config.CHECKPOINT_DB_PATH), check_same_thread=False)
     return SqliteSaver(conn)
+
+
+def delete_thread_checkpoints(thread_id: str, checkpointer=None) -> None:
+    """清理已封存 thread 在 checkpoints.sqlite 中的歷史紀錄"""
+    cp = checkpointer or get_checkpointer()
+    conn = getattr(cp, "conn", None)
+    if conn is None:
+        return
+    try:
+        lock = getattr(cp, "lock", None)
+        if lock:
+            with lock:
+                conn.execute("DELETE FROM checkpoints WHERE thread_id=?", (thread_id,))
+                conn.execute("DELETE FROM writes WHERE thread_id=?", (thread_id,))
+                conn.commit()
+        else:
+            conn.execute("DELETE FROM checkpoints WHERE thread_id=?", (thread_id,))
+            conn.execute("DELETE FROM writes WHERE thread_id=?", (thread_id,))
+            conn.commit()
+    except Exception:
+        pass
 
 
 class AppStore:
@@ -40,6 +93,7 @@ class AppStore:
                     thread_id  TEXT PRIMARY KEY,
                     title      TEXT,
                     kind       TEXT,
+                    archived   INTEGER DEFAULT 0,
                     created_at REAL,
                     updated_at REAL
                 );
@@ -51,27 +105,66 @@ class AppStore:
                 );
                 """
             )
+            try:
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN archived INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
             self._conn.commit()
 
-    # ─── 對話 Session ───
+    # ─── 對話與生命週期 Session ───
     def touch_session(self, thread_id: str, title: str, kind: str) -> None:
         now = time.time()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO sessions(thread_id, title, kind, created_at, updated_at) VALUES (?,?,?,?,?) "
-                "ON CONFLICT(thread_id) DO UPDATE SET updated_at=excluded.updated_at",
-                (thread_id, title[:120], kind, now, now),
+                "INSERT INTO sessions(thread_id, title, kind, archived, created_at, updated_at) VALUES (?,?,?,0,?,?) "
+                "ON CONFLICT(thread_id) DO UPDATE SET updated_at=excluded.updated_at, "
+                "title= CASE WHEN excluded.title != '' THEN excluded.title ELSE sessions.title END",
+                (thread_id, (title or "")[:120], kind, now, now),
             )
             self._conn.commit()
 
-    def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+    def get_session(self, thread_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT thread_id, title, kind, created_at, updated_at FROM sessions "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        keys = ("thread_id", "title", "kind", "created_at", "updated_at")
+            row = self._conn.execute(
+                "SELECT thread_id, title, kind, archived, created_at, updated_at FROM sessions WHERE thread_id=?",
+                (thread_id,),
+            ).fetchone()
+        if not row:
+            return None
+        keys = ("thread_id", "title", "kind", "archived", "created_at", "updated_at")
+        return dict(zip(keys, row))
+
+    def archive_session(self, thread_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET archived=1, updated_at=? WHERE thread_id=?",
+                (time.time(), thread_id),
+            )
+            self._conn.commit()
+
+    def list_sessions(
+        self,
+        limit: int = 50,
+        kind: Optional[str] = None,
+        exclude_kind: Optional[str] = None,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT thread_id, title, kind, archived, created_at, updated_at FROM sessions WHERE 1=1"
+        args: list[Any] = []
+        if not include_archived:
+            sql += " AND COALESCE(archived, 0) = 0"
+        if kind:
+            sql += " AND kind = ?"
+            args.append(kind)
+        if exclude_kind:
+            sql += " AND kind != ?"
+            args.append(exclude_kind)
+        order = "ORDER BY created_at ASC" if kind == "vm_lifecycle" else "ORDER BY updated_at DESC"
+        sql += f" {order} LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        keys = ("thread_id", "title", "kind", "archived", "created_at", "updated_at")
         return [dict(zip(keys, r)) for r in rows]
 
     # ─── 子圖延續資料 ───

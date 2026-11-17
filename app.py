@@ -2,10 +2,7 @@
 
 用法：
     python app.py                     # 互動對話模式 (Supervisor ReAct Agent)
-    python app.py --batch             # 批次處理 ./tickets/ 下所有工單
-    python app.py --file SRA001.txt   # 只處理指定工單檔案
 """
-import argparse
 import sys
 import time
 import uuid
@@ -16,10 +13,18 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 import config
+from cli.jobs import handle_jobs
 from cli.render import console
-from cli.session import choose_pending, run_turn
+from cli.session import check_startup_interrupted_session, resolve_dangling_interrupts, run_turn
 from core.logging_setup import setup_logging
-from supervisor import build_supervisor_agent, SUPERVISOR_TOOLS
+from core.persistence import acquire_background_lock
+from subgraphs.vm_lifecycle import (
+    REVIEW_STAGES,
+    drain_notices,
+    list_lifecycle_jobs,
+    resume_waiting_lifecycles,
+)
+from supervisor import SUPERVISOR_TOOLS, build_supervisor_agent
 from tools.ticket_tools import list_ticket_files
 
 
@@ -28,9 +33,8 @@ def _help_text() -> str:
     lines = [
         "[bold]指令[/bold]",
         "  [cyan]/tickets[/cyan]   列出 tickets 資料夾中的工單檔案",
-        "  [cyan]/batch[/cyan]     批次處理資料夾中所有工單",
         "  [cyan]/paste[/cyan]     貼上整份工單純文字 (存入 tickets 資料夾後交給 Agent 處理)",
-        "  [cyan]/pending[/cyan]   列出等待人工審核或中途中斷的流程並繼續執行",
+        "  [cyan]/jobs[/cyan]      VM 追蹤工作：查看申請後的建立進度，處理硬碟調整 / 初始設定審核",
         "  [cyan]/new[/cyan]       開啟新的對話 Session",
         "  [cyan]/help[/cyan]      顯示說明",
         "  [cyan]exit[/cyan]       離開程式",
@@ -44,7 +48,7 @@ def display_welcome():
     tool_names = ", ".join(t.name for t in SUPERVISOR_TOOLS)
     welcome_text = (
         "[bold cyan]Aria Automation Cloud Ops Agent[/bold cyan]\n"
-        "[white]架構：Supervisor (ReAct) + Tools + 業務子圖 (原生 interrupt HITL) + Local Ollama 工單解析[/white]\n"
+        "[white]架構：Supervisor (ReAct) + Tools + 純 LangGraph 生命週期子圖 (原生 interrupt HITL) + Local Ollama 工單解析[/white]\n"
         f"[dim]已載入工具：{tool_names}[/dim]\n"
         f"[dim]工單資料夾：{config.TICKETS_DIR}[/dim]\n"
         f"[dim]Debug 思考過程顯示：{'開啟' if config.SHOW_AGENT_THOUGHTS else '關閉'} (由 .env 的 SHOW_AGENT_THOUGHTS 設定)[/dim]"
@@ -100,15 +104,13 @@ def paste_ticket() -> str | None:
     return filename
 
 
-def process_ticket_file(agent, filename: str, interactive_followup: bool = True):
+def process_ticket_file(agent, filename: str):
     """以獨立 Session 交給 Supervisor 處理單一工單，並允許使用者就該工單繼續對話"""
     thread_id = f"ticket-{filename}-{uuid.uuid4().hex[:6]}"
     console.print(f"\n[bold magenta]{'═' * 64}[/bold magenta]")
     console.print(f"[bold cyan]▶ 處理工單：{filename}[/bold cyan]  [dim](session {thread_id})[/dim]")
     run_turn(agent, thread_id, f"請處理工單檔案「{filename}」：先解析，再依工單類型調度後續流程。", kind="ticket")
 
-    if not interactive_followup:
-        return
     while True:
         reply = Prompt.ask("[bold blue]回覆 Agent[/bold blue] [dim](直接 Enter 結束此工單)[/dim]", default="").strip()
         if not reply:
@@ -116,31 +118,25 @@ def process_ticket_file(agent, filename: str, interactive_followup: bool = True)
         run_turn(agent, thread_id, reply, kind="ticket")
 
 
-def run_batch(agent, filenames: list[str] | None = None, interactive_followup: bool = True):
-    files = filenames or [p.name for p in list_ticket_files()]
-    if not files:
-        show_ticket_files()
-        return
-    console.print(f"[bold]📦 批次處理 {len(files)} 張工單：{', '.join(files)}[/bold]")
-    for idx, name in enumerate(files, 1):
-        console.print(f"[dim]({idx}/{len(files)})[/dim]")
-        try:
-            process_ticket_file(agent, name, interactive_followup=interactive_followup)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]已中斷批次處理。[/yellow]")
-            return
-    console.print("\n[bold green]✔ 批次工單處理結束！[/bold green]")
+def _show_notices() -> str:
+    """印出背景生命週期子圖的通知，並回傳輸入提示 (有待審核工作時顯示數量)"""
+    for notice in drain_notices():
+        console.print(f"[bold yellow]{escape(notice)}[/bold yellow]")
+    waiting = len(list_lifecycle_jobs(stages=REVIEW_STAGES))
+    return "[bold blue]使用者[/bold blue]" + (f" [yellow](🔔 {waiting} 台待審核，/jobs)[/yellow]" if waiting else "")
 
 
 def run_interactive(agent):
     display_welcome()
     console.print(Panel(_help_text(), title="💬 對話模式", border_style="cyan"))
-    thread_id = f"chat-{uuid.uuid4().hex[:6]}"
+    resumed_tid = check_startup_interrupted_session(agent)
+    thread_id = resumed_tid or f"chat-{uuid.uuid4().hex[:6]}"
     console.print(f"[dim]對話 Session ID: {thread_id}[/dim]\n")
 
     while True:
         try:
-            user_input = Prompt.ask("[bold blue]使用者[/bold blue]").strip()
+            resolve_dangling_interrupts(agent, thread_id)
+            user_input = Prompt.ask(_show_notices()).strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[cyan]感謝使用，再見！[/cyan]")
             break
@@ -155,18 +151,12 @@ def run_interactive(agent):
             console.print(Panel(_help_text(), border_style="cyan"))
         elif cmd == "/tickets":
             show_ticket_files()
-        elif cmd == "/batch":
-            run_batch(agent)
         elif cmd == "/paste":
             filename = paste_ticket()
             if filename:
                 process_ticket_file(agent, filename)
-        elif cmd == "/pending":
-            resumed = choose_pending(agent)
-            if resumed:
-                thread_id = resumed
-                console.print(f"[dim]已切換至 Session {thread_id}，繼續執行...[/dim]")
-                run_turn(agent, thread_id, None)
+        elif cmd == "/jobs":
+            handle_jobs()
         elif cmd == "/new":
             thread_id = f"chat-{uuid.uuid4().hex[:6]}"
             console.print(f"[dim]已開啟新對話 Session ID: {thread_id}[/dim]")
@@ -175,20 +165,14 @@ def run_interactive(agent):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Aria Automation Cloud Ops Agent CLI")
-    parser.add_argument("--batch", action="store_true", help="批次處理 tickets 資料夾中的所有工單後結束")
-    parser.add_argument("--file", action="append", metavar="NAME", help="只處理指定工單檔名 (可重複指定)")
-    parser.add_argument("--no-followup", action="store_true", help="批次模式下不進入每張工單的追問對話")
-    args = parser.parse_args()
-
     setup_logging()
     config.TICKETS_DIR.mkdir(parents=True, exist_ok=True)
     agent = build_supervisor_agent()
-
-    if args.batch or args.file:
-        display_welcome()
-        run_batch(agent, filenames=args.file, interactive_followup=not args.no_followup)
-        return
+    if acquire_background_lock():
+        # 恢復上次未完成的背景 VM 生命週期等待節點 (wait_vm_ready / submit_disk_op / wait_disk_op)
+        resume_waiting_lifecycles()
+    else:
+        console.print("[yellow]⚠️ 偵測到另一個 CLI 實例正在執行背景追蹤；本視窗將不重複啟動背景輪詢。[/yellow]")
 
     run_interactive(agent)
 

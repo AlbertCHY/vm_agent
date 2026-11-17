@@ -103,6 +103,13 @@ CHECKPOINT_DB_PATH: Path = _env_path("CHECKPOINT_DB_PATH", DATA_DIR / "checkpoin
 LOG_DIR: Path = _env_path("LOG_DIR", BASE_DIR / "logs")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# ─── VM 追蹤工作 (申請送出後的背景追蹤：等待建立 → 硬碟調整 → 初始設定) ───
+JOB_POLL_INTERVAL: int = _env_int("JOB_POLL_INTERVAL", 180)            # 一般輪詢間隔 (秒)
+JOB_FAST_POLL_INTERVAL: int = _env_int("JOB_FAST_POLL_INTERVAL", 30)   # 有 Day-2 硬碟動作執行中時的輪詢間隔
+JOB_APPROVAL_TIMEOUT_HOURS: float = float(os.getenv("JOB_APPROVAL_TIMEOUT_HOURS", "24"))
+JOB_BUILD_TIMEOUT_HOURS: float = float(os.getenv("JOB_BUILD_TIMEOUT_HOURS", "2"))
+JOB_DAY2_TIMEOUT_MINUTES: float = float(os.getenv("JOB_DAY2_TIMEOUT_MINUTES", "30"))
+
 # ─── Policies (業務規則 TOML) ───
 POLICIES_DIR: Path = _env_path("POLICIES_DIR", BASE_DIR / "policies")
 

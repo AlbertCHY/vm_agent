@@ -9,6 +9,7 @@ import config
 from clients.llm import get_llm
 from core.persistence import get_checkpointer
 from subgraphs.vm_bootstrap import bootstrap_vm_pipeline
+from subgraphs.vm_disk import adjust_vm_disk
 from subgraphs.vm_provisioning import deploy_vm_pipeline
 from tools import (
     query_vm_by_ip,
@@ -20,6 +21,7 @@ from tools import (
     diagnose_vm_network,
     inspect_vm_detail,
     scan_and_parse_tickets,
+    track_vm_jobs,
 )
 
 # 新增業務子圖 (例如 vm_decommission_flow) 時，只要在這裡註冊其工具即可
@@ -35,9 +37,12 @@ SUPERVISOR_TOOLS: list[BaseTool] = [
     inspect_vm_detail,
     # 工單處理工具組 (Ticket Subsystem)
     scan_and_parse_tickets,
+    # VM 追蹤工作 (唯讀)
+    track_vm_jobs,
     # 業務執行子圖 (Workflows)
     deploy_vm_pipeline,
     bootstrap_vm_pipeline,
+    adjust_vm_disk,
 ]
 
 SUPERVISOR_SYSTEM_PROMPT = config.PROMPTS["supervisor"]["system"]

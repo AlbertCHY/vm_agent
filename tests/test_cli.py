@@ -1,4 +1,4 @@
-"""CLI 介面層：通用審核畫面與對話回合 (以預先排好的輸入取代鍵盤)"""
+"""CLI 介面層：通用審核畫面、對話回合與未完成審核自動詢問續跑 (以預先排好的輸入取代鍵盤)"""
 from collections import deque
 
 import pytest
@@ -19,6 +19,7 @@ def scripted_input(monkeypatch):
         return answers.popleft() if answers else kwargs.get("default", "")
 
     monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(ask))
+    monkeypatch.setattr(session_mod.Prompt, "ask", staticmethod(ask))
     return answers
 
 
@@ -49,4 +50,26 @@ def test_run_turn_with_review(fakes, scripted_input, monkeypatch):  # noqa: F811
     assert final == "done"
     ssh, sink = fakes
     assert ssh.calls and len(sink.records) == 1
-    assert session_mod.list_pending(agent) == []
+    assert list(agent.get_state({"configurable": {"thread_id": "cli-t1"}}).interrupts or ()) == []
+
+
+def test_interrupted_turn_auto_prompts_resume_or_cancel(fakes, scripted_input):  # noqa: F811
+    agent, _ = build_agent_calling(bootstrap_vm_pipeline, {"ip": "10.0.0.20", "cs_mode": "SKIP", "skip_disk": True})
+
+    # 模擬第一次審核時按下 Ctrl+C 中斷
+    def raise_kb(*a, **k):
+        raise KeyboardInterrupt()
+
+    orig_ask = review_mod.Prompt.ask
+    review_mod.Prompt.ask = staticmethod(raise_kb)
+    session_mod.run_turn(agent, "cli-t2", "幫我對 10.0.0.20 做基本設定")
+    review_mod.Prompt.ask = orig_ask
+
+    # 確認此時 Session 停在 interrupt
+    assert len(agent.get_state({"configurable": {"thread_id": "cli-t2"}}).interrupts) == 1
+
+    # 下次呼叫 resolve_dangling_interrupts 時自動詢問「是否繼續審核？[y/n]」→ 輸入 y 並核准 a
+    scripted_input.extend(["y", "a"])
+    final = session_mod.resolve_dangling_interrupts(agent, "cli-t2")
+    assert final == "done"
+    assert list(agent.get_state({"configurable": {"thread_id": "cli-t2"}}).interrupts or ()) == []

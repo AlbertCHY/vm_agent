@@ -12,6 +12,7 @@ def get_llm(model: str | None = None, temperature: float | None = None) -> ChatG
         "model": model or config.GEMINI_MODEL,
         "google_api_key": config.GOOGLE_API_KEY,
         "include_thoughts": config.SHOW_AGENT_THOUGHTS,
+        "automatic_function_calling": {"disable": True},
     }
     if temperature is not None:
         kwargs["temperature"] = temperature

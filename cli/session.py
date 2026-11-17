@@ -1,7 +1,6 @@
-"""Supervisor 對話回合執行：串流顯示、人工審核中斷處理、待續流程 (/pending)"""
+"""Supervisor 對話回合執行：串流顯示、人工審核中斷處理、未完成審核自動詢問續跑"""
 import json
 import logging
-import time
 from typing import Any, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -10,12 +9,12 @@ from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
-from rich.table import Table
 
 import config
 from cli.render import console, msg_text, msg_thoughts, print_progress, print_thoughts, print_tool_result
 from cli.review import handle_review
 from core.persistence import get_app_store
+from subgraphs.vm_lifecycle import LIFECYCLE_KIND
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +50,9 @@ def _render_update(update: dict[str, Any], final_text: str) -> str:
 
 def _stream(agent, payload: Any, run_config: dict[str, Any]) -> str:
     final_text = ""
-    for ns, mode, chunk in agent.stream(payload, config=run_config,
-                                        stream_mode=["updates", "custom"], subgraphs=True):
+    for ns, mode, chunk in agent.stream(
+        payload, config=run_config, stream_mode=["updates", "custom"], subgraphs=True
+    ):
         if mode == "custom":
             if config.SHOW_AGENT_THOUGHTS:
                 print_progress(chunk)
@@ -68,6 +68,66 @@ def _collect_decisions(interrupts) -> Command:
     return Command(resume={itr.id: handle_review(itr.value) for itr in interrupts})
 
 
+def _skip_decisions(interrupts, reason: str = "使用者放棄未完成的審核") -> Command:
+    skip_val = {"action": "skip", "edits": {}, "feedback": reason}
+    return Command(resume={itr.id: skip_val for itr in interrupts})
+
+
+def resolve_dangling_interrupts(agent, thread_id: str) -> Optional[str]:
+    """
+    若指定對話 Session 仍有上次按 Ctrl+C 中斷而未完成的審核 (state.interrupts)，
+    自動詢問使用者是否繼續審核：
+    - 選 y：繼續完成該審核並回傳 Supervisor 的回覆文字
+    - 選 n：自動以 skip 取消該工具呼叫 (補齊 ToolMessage)，避免後續傳入 HumanMessage 時報錯
+    """
+    run_config = _run_config(thread_id)
+    pending = list(agent.get_state(run_config).interrupts or ())
+    if not pending:
+        return None
+
+    ans = Prompt.ask(
+        "⏸️ 偵測到上一次有未完成的審核，是否繼續審核？",
+        choices=["y", "n", "Y", "N"],
+        default="y",
+    ).lower()
+    if ans == "y":
+        return run_turn(agent, thread_id, user_text=None)
+
+    while pending:
+        _stream(agent, _skip_decisions(pending), run_config)
+        pending = list(agent.get_state(run_config).interrupts or ())
+    console.print("[dim]已取消上次未完成的審核。[/dim]")
+    return None
+
+
+def check_startup_interrupted_session(agent) -> Optional[str]:
+    """CLI 啟動時檢查是否有上次未完成審核的前景對話 Session，若有則詢問是否續跑"""
+    for s in get_app_store().list_sessions(limit=20, exclude_kind=LIFECYCLE_KIND):
+        tid = s["thread_id"]
+        try:
+            state = agent.get_state(_run_config(tid))
+        except Exception:
+            continue
+        pending = list(state.interrupts or ())
+        if not pending:
+            continue
+        title = escape((s.get("title") or tid)[:60])
+        ans = Prompt.ask(
+            f"⏸️ 偵測到上次對話「{title}」({tid}) 有未完成的審核，是否繼續？",
+            choices=["y", "n", "Y", "N"],
+            default="y",
+        ).lower()
+        if ans == "y":
+            run_turn(agent, tid, user_text=None)
+            return tid
+        while pending:
+            _stream(agent, _skip_decisions(pending), _run_config(tid))
+            pending = list(agent.get_state(_run_config(tid)).interrupts or ())
+        console.print("[dim]已取消上次未完成的審核。[/dim]")
+        break
+    return None
+
+
 def run_turn(agent, thread_id: str, user_text: Optional[str] = None, kind: str = "chat") -> str:
     """
     執行一輪對話 (user_text 為 None 時代表繼續先前暫停的流程)。
@@ -77,13 +137,21 @@ def run_turn(agent, thread_id: str, user_text: Optional[str] = None, kind: str =
     store = get_app_store()
     final_text = ""
 
-    if user_text is not None:
-        store.touch_session(thread_id, user_text, kind)
-        payload: Any = {"messages": [HumanMessage(content=user_text)]}
-    else:
-        payload = None
-
     try:
+        state = agent.get_state(run_config)
+        pending = list(state.interrupts or ())
+
+        if user_text is not None and pending:
+            # 同一對話上一輪在審核中被 Ctrl+C 中斷：先詢問要繼續審核或放棄結案
+            resolve_dangling_interrupts(agent, thread_id)
+            pending = []
+
+        if user_text is not None:
+            store.touch_session(thread_id, user_text, kind)
+            payload: Any = {"messages": [HumanMessage(content=user_text)]}
+        else:
+            payload = None
+
         while True:
             state = agent.get_state(run_config)
             pending = list(state.interrupts or ())
@@ -97,7 +165,7 @@ def run_turn(agent, thread_id: str, user_text: Optional[str] = None, kind: str =
                 break
             payload = _collect_decisions(pending)
     except KeyboardInterrupt:
-        console.print("\n[yellow]已中斷本輪執行；若流程停在人工審核，可稍後以 /pending 繼續。[/yellow]")
+        console.print("\n[yellow]已中斷本輪執行；下次輸入時將自動詢問是否繼續未完成的審核。[/yellow]")
         return final_text
     except Exception as e:
         logger.exception("Supervisor 執行錯誤 (thread=%s)", thread_id)
@@ -107,38 +175,3 @@ def run_turn(agent, thread_id: str, user_text: Optional[str] = None, kind: str =
     if final_text:
         console.print(Panel(Markdown(final_text), title="🤖 Supervisor", border_style="green"))
     return final_text
-
-
-def list_pending(agent) -> list[dict[str, Any]]:
-    """列出仍停在人工審核或中途中斷的對話 Session"""
-    pending = []
-    for s in get_app_store().list_sessions():
-        try:
-            state = agent.get_state(_run_config(s["thread_id"]))
-        except Exception:
-            continue
-        if state.interrupts or state.next:
-            pending.append({**s, "waiting_review": bool(state.interrupts)})
-    return pending
-
-
-def choose_pending(agent) -> Optional[str]:
-    items = list_pending(agent)
-    if not items:
-        console.print("[green]✔ 目前沒有等待審核或中斷的流程。[/green]")
-        return None
-    table = Table(title="⏸️ 待續流程", show_header=True, header_style="bold cyan")
-    table.add_column("#", width=4)
-    table.add_column("Session", style="dim")
-    table.add_column("狀態")
-    table.add_column("最初的需求", style="white")
-    table.add_column("最後更新", style="dim")
-    for i, it in enumerate(items, 1):
-        status = "[yellow]等待人工審核[/yellow]" if it["waiting_review"] else "[red]中途中斷[/red]"
-        table.add_row(str(i), it["thread_id"], status, escape(it["title"] or ""),
-                      time.strftime("%m-%d %H:%M", time.localtime(it["updated_at"])))
-    console.print(table)
-    choice = Prompt.ask("選擇要繼續的流程編號 (Enter 取消)", default="").strip()
-    if not choice.isdigit() or not 1 <= int(choice) <= len(items):
-        return None
-    return items[int(choice) - 1]["thread_id"]

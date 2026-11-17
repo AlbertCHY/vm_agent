@@ -9,6 +9,7 @@ from tools.vm_diag_tools import (
     inspect_vm_detail,
 )
 from tools.ticket_tools import scan_and_parse_tickets
+from tools.job_tools import track_vm_jobs
 
 __all__ = [
     "query_vm_by_ip",
@@ -20,4 +21,5 @@ __all__ = [
     "diagnose_vm_network",
     "inspect_vm_detail",
     "scan_and_parse_tickets",
+    "track_vm_jobs",
 ]

@@ -22,7 +22,7 @@ from core.secrets import get_audit_sink
 from subgraphs.common.review import APPROVE, EDIT, REJECT, SKIP, ReviewField, ask_review, review_request
 from subgraphs.vm_provisioning import reasoning
 from subgraphs.vm_provisioning.resolver import (
-    DEPLOYMENT_NAME, OS_IMAGE, display_value, resolve_values, validate_values,
+    DEPLOYMENT_NAME, SRC_USER, display_value, is_blank, resolve_values, validate_values,
 )
 from subgraphs.vm_provisioning.state import ProvisioningState
 
@@ -260,6 +260,19 @@ def route_review(state: ProvisioningState) -> str:
 
 
 # 8. 送出 catalog request
+def submitted_spec_text(state: ProvisioningState) -> str:
+    """實際送出的規格 (給 Supervisor 摘要用，避免沿用最初需求描述中、已在審核時被修改的舊值)"""
+    values = state.get("values") or {}
+    sources = state.get("sources") or {}
+    lines = ["**實際送出的規格**（以此為準；標示「審核修改」者為人工審查時變更的值）："]
+    for f in _fields(state):
+        if not f.submit or not f.is_visible(values) or is_blank(values.get(f.id)):
+            continue
+        mark = "（審核修改）" if sources.get(f.id) == SRC_USER else ""
+        lines.append(f"- {f.label} [{f.id}]: {display_value(f, values.get(f.id))}{mark}")
+    return "\n".join(lines)
+
+
 def submit_request(state: ProvisioningState) -> dict[str, Any]:
     emit("[VM Provisioning] 正在送出 Service Broker catalog 申請...", stage="vm_provisioning")
     project = state["project"]
@@ -285,6 +298,7 @@ def submit_request(state: ProvisioningState) -> dict[str, Any]:
             f"- **Deployment ID**: `{result.deployment_id}`\n"
             f"- **模板**: {template['name']} (v{template['version']})\n"
             f"- **專案**: {project['name']}\n\n"
+            f"{submitted_spec_text(state)}\n\n"
             "申請會先經過 Aria 上的審核，核准後開始建立虛擬機。"
         )
         return {"execution_result": exec_res, "messages": [AIMessage(content=msg)]}

@@ -331,18 +331,18 @@ def run_step(state: BootstrapState) -> dict[str, Any]:
     updates: dict[str, Any] = {"step_index": idx + 1}
 
     if step.skip_if and ctx.get(step.skip_if):
-        results.append({"step": name, "status": "skipped", "exit_code": 0, "detail": "依設定略過"})
+        results.append({"step": name, "step_idx": idx, "status": "skipped", "exit_code": 0, "detail": "依設定略過"})
         return {**updates, "step_results": results}
 
     if step.rotates_password and _secrets(state) is None:
-        results.append({"step": name, "status": "failed", "exit_code": -1,
+        results.append({"step": name, "step_idx": idx, "status": "failed", "exit_code": -1,
                         "detail": "本機記憶體中的密碼已遺失 (程式可能已重啟)，無法執行改密碼步驟"})
         return {**updates, "step_results": results, "stopped": True}
 
     emit(f"[Bootstrap] ▶ 執行 {name} ...", stage="vm_bootstrap", step=step.id)
     ec, combined = _exec_step(state, step)
     if ec == 0:
-        results.append({"step": name, "status": "success", "exit_code": 0, "detail": combined[-400:]})
+        results.append({"step": name, "step_idx": idx, "status": "success", "exit_code": 0, "detail": combined[-400:]})
         if step.rotates_password:
             # 密碼修改成功：留存密碼紀錄 (若尚未於 PAM 階段留存)，後續改以新密碼登入
             if not state.get("credentials_saved"):
@@ -351,7 +351,7 @@ def run_step(state: BootstrapState) -> dict[str, Any]:
             if state.get("login_mode") != "key":
                 updates["login_mode"] = "admin"
     else:
-        results.append({"step": name, "status": "failed", "exit_code": ec,
+        results.append({"step": name, "step_idx": idx, "status": "failed", "exit_code": ec,
                         "detail": combined[-500:] or f"exit code {ec}"})
         if step.stop_on_fail:
             updates["stopped"] = True

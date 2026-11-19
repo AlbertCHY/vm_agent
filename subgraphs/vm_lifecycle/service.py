@@ -226,14 +226,17 @@ def prepare_bootstrap_retry(job_id: str, error: str = "", graph=None) -> None:
 
     if failed_idx is not None:
         kept_steps = steps[:failed_idx]
+        target_step_idx = steps[failed_idx].get("step_idx")
+        if target_step_idx is None:
+            target_step_idx = sum(1 for sr in kept_steps if not str(sr.get("step", "")).startswith("0"))
         g.update_state(
             cfg,
             {
                 "error": "",
-                "note": error or f"步驟 {failed_idx + 1} 失敗，可再進 /jobs 從該步續跑",
+                "note": error or f"步驟 {target_step_idx + 1} 失敗，可再進 /jobs 從該步續跑",
                 "execution_result": None,
                 "step_results": kept_steps,
-                "step_index": failed_idx,
+                "step_index": target_step_idx,
                 "stopped": False,
             },
             as_node="connect_and_upload",

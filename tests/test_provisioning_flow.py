@@ -175,3 +175,27 @@ def test_edit_memory_by_label_and_template(aria, monkeypatch):
     assert "Memory (GB) [memorySize]: 32G (32768)（審核修改）" in tool_msg.content   # 摘要使用修改後的值
     assert sub["item_id"] == "item-ubuntu"
     assert sub["inputs"]["memorySize"] == 32768
+
+
+def test_reject_clears_choice_cache_and_reparses_intent(aria, monkeypatch):
+    """驗證人工審核退回 (reject) 時會清除模型選擇快取並重新抽取意圖"""
+    llm = _use_llm(monkeypatch, [BASE_INTENT, {**BASE_INTENT, "cpu": 8}])
+    agent, _ = build_agent_calling(deploy_vm_pipeline, {"requirement_description": "開一台 Oracle"})
+    answers = iter([{"action": "reject", "feedback": "改 8 核"}, {"action": "approve"}])
+    requests, tool_msg = drive(agent, lambda req: next(answers))
+
+    assert len(requests) == 2
+    assert llm.calls == {"VMIntent": 2, "TemplateChoice": 2, "OsImageChoice": 2}
+    assert aria.catalog.submitted[0]["inputs"]["cpuCount"] == 8
+    assert tool_msg.artifact["status"] == "submitted"
+
+
+def test_deploy_with_track_false_skips_lifecycle_job(aria, monkeypatch):
+    """驗證 track=False 時僅送出申請，不建立生命週期追蹤工作"""
+    _use_llm(monkeypatch, [BASE_INTENT])
+    agent, _ = build_agent_calling(
+        deploy_vm_pipeline, {"requirement_description": "在 proj-demo 開 Oracle 9.6", "track": False}
+    )
+    _, tool_msg = drive(agent, lambda req: {"action": "approve"})
+    assert tool_msg.artifact["status"] == "submitted"
+    assert "job_id" not in tool_msg.artifact

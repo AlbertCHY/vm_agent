@@ -59,3 +59,45 @@ def test_parse_ticket_uses_form_fallback_and_structured_hint():
     assert ticket.ticket_type == "CREATE_VM"
     assert "請先以地端資源開立" in (ticket.approval_notes or "")
     assert ticket.action_items[0]["description"] == "vm_name: proj-demo-AP01，cpu: 4"
+
+
+def test_resolve_ticket_file_blocks_path_traversal_and_resolves_ext(tmp_path, monkeypatch):
+    import pytest
+    import config
+    from tools.ticket_tools import resolve_ticket_file
+
+    monkeypatch.setattr(config, "TICKETS_DIR", tmp_path)
+    sample = tmp_path / "REQ001.txt"
+    sample.write_text("hello", encoding="utf-8")
+
+    # 省略副檔名可自動補全
+    assert resolve_ticket_file("REQ001") == sample.resolve()
+    # 路徑遍歷攻擊必須拒絕
+    with pytest.raises(ValueError, match="不允許存取"):
+        resolve_ticket_file("../.env")
+    # 找不到檔案應拋出 FileNotFoundError
+    with pytest.raises(FileNotFoundError):
+        resolve_ticket_file("NOT_EXIST")
+
+
+def test_parse_ticket_file_caches_by_mtime(tmp_path, monkeypatch):
+    from schemas import ParsedTicket
+    import tools.ticket_tools as ticket_tools
+
+    ticket_tools._PARSE_CACHE.clear()
+    f = tmp_path / "t1.txt"
+    f.write_text("開一台 Ubuntu", encoding="utf-8")
+
+    calls = {"n": 0}
+
+    def fake_parse(raw_text: str, source_name=None):
+        calls["n"] += 1
+        return ParsedTicket(
+            ticket_id="REQ1", applicant="A", department="D",
+            ticket_type="CREATE_VM", summary=f"call-{calls['n']}", action_items=[],
+        )
+
+    monkeypatch.setattr(ticket_tools, "parse_ticket", fake_parse)
+    first = ticket_tools.parse_ticket_file(f)
+    second = ticket_tools.parse_ticket_file(f)
+    assert calls["n"] == 1 and first.summary == second.summary == "call-1"

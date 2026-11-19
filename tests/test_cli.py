@@ -73,3 +73,49 @@ def test_interrupted_turn_auto_prompts_resume_or_cancel(fakes, scripted_input): 
     final = session_mod.resolve_dangling_interrupts(agent, "cli-t2")
     assert final == "done"
     assert list(agent.get_state({"configurable": {"thread_id": "cli-t2"}}).interrupts or ()) == []
+
+
+def test_interrupted_turn_cancel_clears_interrupts(fakes, scripted_input):  # noqa: F811
+    """中斷後選擇 n 放棄審核，應補齊 ToolMessage 並清空 interrupts，不影響後續對話"""
+    agent, _ = build_agent_calling(bootstrap_vm_pipeline, {"ip": "10.0.0.21", "cs_mode": "SKIP", "skip_disk": True})
+
+    def raise_kb(*a, **k):
+        raise KeyboardInterrupt()
+
+    orig_ask = review_mod.Prompt.ask
+    review_mod.Prompt.ask = staticmethod(raise_kb)
+    session_mod.run_turn(agent, "cli-t3", "幫我對 10.0.0.21 做基本設定")
+    review_mod.Prompt.ask = orig_ask
+
+    assert len(agent.get_state({"configurable": {"thread_id": "cli-t3"}}).interrupts) == 1
+
+    scripted_input.extend(["n"])
+    final = session_mod.resolve_dangling_interrupts(agent, "cli-t3")
+    assert final is None
+    assert list(agent.get_state({"configurable": {"thread_id": "cli-t3"}}).interrupts or ()) == []
+    ssh, _ = fakes
+    assert ssh.calls == []
+
+
+def test_check_startup_interrupted_session_resumes_chat_and_skips_lifecycle(fakes, scripted_input):  # noqa: F811
+    """啟動恢復應略過 vm_lifecycle session，並針對未完成審核的前景對話詢問續跑"""
+    from core.persistence import get_app_store
+    from subgraphs.vm_lifecycle import LIFECYCLE_KIND
+
+    store = get_app_store()
+    store.touch_session("vmjob-ignore1", "bg-job", kind=LIFECYCLE_KIND)
+
+    agent, _ = build_agent_calling(bootstrap_vm_pipeline, {"ip": "10.0.0.22", "cs_mode": "SKIP", "skip_disk": True})
+
+    def raise_kb(*a, **k):
+        raise KeyboardInterrupt()
+
+    orig_ask = review_mod.Prompt.ask
+    review_mod.Prompt.ask = staticmethod(raise_kb)
+    session_mod.run_turn(agent, "cli-startup-1", "啟動恢復測試")
+    review_mod.Prompt.ask = orig_ask
+
+    scripted_input.extend(["y", "a"])
+    resumed_tid = session_mod.check_startup_interrupted_session(agent)
+    assert resumed_tid == "cli-startup-1"
+    assert list(agent.get_state({"configurable": {"thread_id": "cli-startup-1"}}).interrupts or ()) == []

@@ -66,7 +66,7 @@ SSH_PRIVATE_KEY_PATH: Path = _env_path("SSH_PRIVATE_KEY_PATH", Path.home() / ".s
 SSH_PUBLIC_KEY_PATH: Path = _env_path("SSH_PUBLIC_KEY_PATH", Path.home() / ".ssh" / "id_rsa.pub")
 SSH_PUBLIC_KEY: str = os.getenv("SSH_PUBLIC_KEY", "").strip()
 SSH_KEY_PASSPHRASE: str | None = os.getenv("SSH_KEY_PASSPHRASE") or None
-DEFAULT_SSH_USER: str = os.getenv("DEFAULT_SSH_USER", "user1")
+DEFAULT_SSH_USER: str = os.getenv("DEFAULT_SSH_USER", "root")
 SSH_PORT: int = _env_int("SSH_PORT", 22)
 SSH_TIMEOUT: int = _env_int("SSH_TIMEOUT", 10)
 # true: 只連線 known_hosts 中已存在的主機；false: 自動接受新主機金鑰 (內網維運常見設定)

@@ -15,7 +15,6 @@ from langgraph.checkpoint.memory import InMemorySaver
 import cli.jobs as jobs_cli
 import cli.review as review_mod
 from helpers import build_agent_calling, drive
-from subgraphs.vm_bootstrap import nodes as boot_nodes
 from subgraphs.vm_bootstrap.state import BootstrapState
 from subgraphs.vm_disk import nodes as disk_nodes
 from subgraphs.vm_disk import tool as disk_tool
@@ -411,6 +410,55 @@ def test_runner_per_task_wake_event_and_cleanup():
     assert "task-a" not in runner._WAKE_EVENTS
     assert runner.get_live_progress("task-a") == {}
     runner.cleanup_task_resources("task-b")
+
+
+def test_prepare_bootstrap_retry_resumes_from_failed_step(lc_graph, fakes, monkeypatch):  # noqa: F811
+    """驗證 Bootstrap 某步驟失敗後，prepare_bootstrap_retry 保留已完成步驟，重試時從該失敗步續跑"""
+    ssh, _ = fakes
+    aria = FakeAria()
+    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
+    aria.deployments.dep_status["dep-1"] = [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
+
+    job = _new_job(lc_graph)
+    lc_graph.invoke(None, config=lifecycle_config(job.id))
+
+    orig_exec = ssh.exec_command
+    fail_hostname = {"active": True}
+
+    def fail_at_hostname(ip, cmd, **kw):
+        if cmd.endswith("set_hostname.sh") and fail_hostname["active"]:
+            return 1, "", "hostnamectl error"
+        return orig_exec(ip, cmd, **kw)
+
+    ssh.exec_command = fail_at_hostname
+    answers = deque(["e", "cs_mode=SKIP, skip_disk=true"])
+    monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
+
+    jobs_cli.run_bootstrap(job.id, graph=lc_graph)
+    # set_hostname 失敗會觸發 prepare_bootstrap_retry，回到 BOOTSTRAP_RUNNING 且保留前面已完成步驟
+    j_retry = get_lifecycle_job(job.id, graph=lc_graph)
+    assert j_retry.stage == BOOTSTRAP_RUNNING
+
+    # 修復失敗原因後重試：應從 set_hostname.sh 續跑，不重跑 add_pub_key.sh 與 set_no_passwd.sh
+    fail_hostname["active"] = False
+    ssh.calls.clear()
+    jobs_cli.run_bootstrap(job.id, graph=lc_graph)
+    retry_cmds = [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls]
+    assert retry_cmds[0] == "set_hostname.sh"
+    assert "add_pub_key.sh" not in retry_cmds
+    assert "set_no_passwd.sh" not in retry_cmds
+    assert get_lifecycle_job(job.id, graph=lc_graph).stage == DONE
+
+
+def test_cancel_lifecycle_job_archives_and_hides_from_list(lc_graph):
+    """驗證 cancel_lifecycle_job 會封存工作並從預設 list_lifecycle_jobs 清單中移除"""
+    from subgraphs.vm_lifecycle import cancel_lifecycle_job, list_lifecycle_jobs
+
+    job = _new_job(lc_graph, deployment_name="proj-cancel-01")
+    assert any(j.id == job.id for j in list_lifecycle_jobs(graph=lc_graph))
+
+    cancel_lifecycle_job(job.id, graph=lc_graph)
+    assert all(j.id != job.id for j in list_lifecycle_jobs(graph=lc_graph))
 
 
 def test_background_thread_end_to_end_and_track_tool(lc_graph, monkeypatch):

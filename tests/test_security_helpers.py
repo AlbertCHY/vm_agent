@@ -63,3 +63,68 @@ def test_forbidden_paths():
     assert is_forbidden_path("/opt/app/server.KEY")
     assert not is_forbidden_path("/etc/ssh/sshd_config")
     assert not is_forbidden_path("/home/u/.ssh/authorized_keys")
+
+
+def test_run_diag_script_falls_back_when_sudo_fails(monkeypatch):
+    import tools.vm_diag_tools as diag
+
+    calls = []
+
+    class FakeSSH:
+        def exec_command(self, ip, cmd, sudo=False, env=None, cmd_timeout=None):
+            calls.append(sudo)
+            if sudo:
+                return 1, "", "sudo: a password is required"
+            return 0, "=== [SECTION:BASIC] ===\nok-without-sudo", ""
+
+    monkeypatch.setattr(diag, "get_ssh_client", lambda: FakeSSH())
+    code, out, err, note = diag._run_diag_script("10.0.0.10", "diag_system_health.sh")
+    assert calls == [True, False]
+    assert code == 0 and "ok-without-sudo" in out
+    assert "自動降級" in note
+
+
+def test_extract_sections_and_inspect_vm_detail_validation():
+    import tools.vm_diag_tools as diag
+
+    sec = diag._extract_sections("header\n=== [SECTION:ONE] ===\nline1\n=== [SECTION:TWO] ===\nline2\n")
+    assert sec["ONE"] == "line1" and sec["TWO"] == "line2"
+
+    # 不支援的 check_type
+    assert "不支援的 `check_type`" in diag.inspect_vm_detail.invoke({"ip": "10.0.0.10", "check_type": "exec", "target": "id"})
+    # 非法服務名 (防止指令注入字元)
+    assert "無效的服務名稱格式" in diag.inspect_vm_detail.invoke({"ip": "10.0.0.10", "check_type": "service", "target": "sshd;id"})
+    # 禁止讀取敏感檔案
+    assert "禁止讀取" in diag.inspect_vm_detail.invoke({"ip": "10.0.0.10", "check_type": "file", "target": "/etc/shadow"})
+    # 非法程序/Port 關鍵字
+    assert "無效的程序或 Port 關鍵字" in diag.inspect_vm_detail.invoke({"ip": "10.0.0.10", "check_type": "process_or_port", "target": "80 && id"})
+
+
+def test_ssh_ensure_initial_login_pam_and_fallback(monkeypatch, tmp_path):
+    """驗證 ensure_initial_login 的 PAM 過期強制改密碼與 SSH 私鑰降級路徑"""
+    ssh = SSHClient(key_path=tmp_path / "missing_key")
+
+    # 1. 初始密碼過期 -> 觸發 PAM 強制改密碼 -> 新密碼驗證成功
+    def fake_exec_pam(ip, cmd, username=None, password=None, cmd_timeout=None):
+        if password == "old-pw":
+            return 1, "WARNING: Your password has expired", ""
+        if password == "new-pw":
+            return 0, "user1\n", ""
+        return ssh.ERR_AUTH, "", "auth failed"
+
+    monkeypatch.setattr(ssh, "exec_command", fake_exec_pam)
+    monkeypatch.setattr(ssh, "_handle_pam_expired_password", lambda *a: (True, "PAM 已改密碼"))
+    ec, active_pw, pam_changed, msg = ssh.ensure_initial_login("10.0.0.10", "user1", "old-pw", "new-pw")
+    assert ec == 0 and active_pw == "new-pw" and pam_changed is True and "PAM" in msg
+
+    # 2. 無初始密碼時退回 SSH 私鑰連線
+    fake_key = tmp_path / "id_rsa"
+    fake_key.write_text("dummy", encoding="utf-8")
+    ssh2 = SSHClient(key_path=fake_key)
+    monkeypatch.setattr(
+        ssh2,
+        "exec_command",
+        lambda ip, cmd, username=None, password=None, cmd_timeout=None: (0, "user1\n", "") if password is None else (ssh2.ERR_AUTH, "", "no"),
+    )
+    ec2, active_pw2, pam2, _ = ssh2.ensure_initial_login("10.0.0.10", "user1", None, "new-pw")
+    assert ec2 == 0 and active_pw2 is None and pam2 is False

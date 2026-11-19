@@ -23,7 +23,6 @@ shutil.copy(ROOT / "policies" / "bootstrap_steps.toml", _POLICIES / "bootstrap_s
 os.environ["POLICIES_DIR"] = str(_POLICIES)
 os.environ["DATA_DIR"] = str(_TMP / "data")
 os.environ["LOG_DIR"] = str(_TMP / "logs")
-os.environ["BOOTSTRAP_LOG_DIR"] = str(_TMP / "logs")
 os.environ["SHOW_AGENT_THOUGHTS"] = "false"
 os.environ.setdefault("GOOGLE_API_KEY", "test-key")
 

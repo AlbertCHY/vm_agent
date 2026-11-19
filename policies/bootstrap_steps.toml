@@ -2,7 +2,7 @@
 # 新 Linux VM 基本設定 (Bootstrap) 步驟定義 — 依序執行
 #
 # 樣板變數 (用於 env，會出現在遠端命令列，請勿放機密)：
-#   {ip} {hostname} {init_user} {user1} {user2} {pub_key}
+#   {ip} {hostname} {user1} {user2} {pub_key}
 #   {cs_mode} {cs_proxy_host} {cs_proxy_port} {zabbix_servers} {zabbix_conf}
 # 機密樣板變數 (只能用於 secret_env，會以權限 600 的暫存檔傳遞並在載入後立即刪除)：
 #   {admin_password} {user2_password} {mdr_cid} {mdr_token} {ngav_cid} {ngav_token}

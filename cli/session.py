@@ -73,6 +73,13 @@ def _skip_decisions(interrupts, reason: str = "使用者放棄未完成的審核
     return Command(resume={itr.id: skip_val for itr in interrupts})
 
 
+def _cancel_pending_interrupts(agent, run_config: dict[str, Any], pending) -> None:
+    while pending:
+        _stream(agent, _skip_decisions(pending), run_config)
+        pending = list(agent.get_state(run_config).interrupts or ())
+    console.print("[dim]已取消上次未完成的審核。[/dim]")
+
+
 def resolve_dangling_interrupts(agent, thread_id: str) -> Optional[str]:
     """
     若指定對話 Session 仍有上次按 Ctrl+C 中斷而未完成的審核 (state.interrupts)，
@@ -93,10 +100,7 @@ def resolve_dangling_interrupts(agent, thread_id: str) -> Optional[str]:
     if ans == "y":
         return run_turn(agent, thread_id, user_text=None)
 
-    while pending:
-        _stream(agent, _skip_decisions(pending), run_config)
-        pending = list(agent.get_state(run_config).interrupts or ())
-    console.print("[dim]已取消上次未完成的審核。[/dim]")
+    _cancel_pending_interrupts(agent, run_config, pending)
     return None
 
 
@@ -104,8 +108,9 @@ def check_startup_interrupted_session(agent) -> Optional[str]:
     """CLI 啟動時檢查是否有上次未完成審核的前景對話 Session，若有則詢問是否續跑"""
     for s in get_app_store().list_sessions(limit=20, exclude_kind=LIFECYCLE_KIND):
         tid = s["thread_id"]
+        run_config = _run_config(tid)
         try:
-            state = agent.get_state(_run_config(tid))
+            state = agent.get_state(run_config)
         except Exception:
             continue
         pending = list(state.interrupts or ())
@@ -120,10 +125,7 @@ def check_startup_interrupted_session(agent) -> Optional[str]:
         if ans == "y":
             run_turn(agent, tid, user_text=None)
             return tid
-        while pending:
-            _stream(agent, _skip_decisions(pending), _run_config(tid))
-            pending = list(agent.get_state(_run_config(tid)).interrupts or ())
-        console.print("[dim]已取消上次未完成的審核。[/dim]")
+        _cancel_pending_interrupts(agent, run_config, pending)
         break
     return None
 
@@ -138,32 +140,24 @@ def run_turn(agent, thread_id: str, user_text: Optional[str] = None, kind: str =
     final_text = ""
 
     try:
-        state = agent.get_state(run_config)
-        pending = list(state.interrupts or ())
-
-        if user_text is not None and pending:
-            # 同一對話上一輪在審核中被 Ctrl+C 中斷：先詢問要繼續審核或放棄結案
-            resolve_dangling_interrupts(agent, thread_id)
-            pending = []
+        pending = list(agent.get_state(run_config).interrupts or ())
 
         if user_text is not None:
+            if pending:
+                # 同一對話上一輪在審核中被 Ctrl+C 中斷：先詢問要繼續審核或放棄結案
+                resolve_dangling_interrupts(agent, thread_id)
             store.touch_session(thread_id, user_text, kind)
             payload: Any = {"messages": [HumanMessage(content=user_text)]}
         else:
-            payload = None
+            payload = _collect_decisions(pending) if pending else None
 
         while True:
-            state = agent.get_state(run_config)
-            pending = list(state.interrupts or ())
-            if payload is None and pending:
-                payload = _collect_decisions(pending)
-                continue
             final_text = _stream(agent, payload, run_config) or final_text
-            store.touch_session(thread_id, user_text or "", kind)
             pending = list(agent.get_state(run_config).interrupts or ())
             if not pending:
                 break
             payload = _collect_decisions(pending)
+        store.touch_session(thread_id, user_text or "", kind)
     except KeyboardInterrupt:
         console.print("\n[yellow]已中斷本輪執行；下次輸入時將自動詢問是否繼續未完成的審核。[/yellow]")
         return final_text

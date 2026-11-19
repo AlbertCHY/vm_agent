@@ -6,9 +6,6 @@ from clients.aria.cache import TTLCache
 from clients.aria.models import CatalogVersion, FormField, FormOption
 from clients.aria.session import AriaSession
 
-# 申請請求的頂層欄位 (不放在 inputs 內)
-TOP_LEVEL_FIELDS = ("project", "deploymentName")
-
 
 def _parse_options(value_list: Any) -> tuple[Optional[list[FormOption]], Optional[str]]:
     if isinstance(value_list, dict):            # {"id": "...", "type": "scriptAction"}
@@ -63,11 +60,11 @@ def build_form_fields(version: CatalogVersion, form: Optional[dict[str, Any]]) -
             options = [FormOption(value=v, label=str(v)) for v in prop["enum"]]
 
         default = fs.get("default", prop.get("default"))
-        default_source = conditional = None
+        default_source = None
         if isinstance(default, dict) and default.get("type") == "scriptAction":
             default_source, default = default.get("id"), prop.get("default")
         elif isinstance(default, list):
-            conditional, default = default, prop.get("default")
+            default = prop.get("default")
 
         vis = visibility.get(fid, True)
         fields.append(FormField(
@@ -79,9 +76,7 @@ def build_form_fields(version: CatalogVersion, form: Optional[dict[str, Any]]) -
             options_source=options_source,
             default=default,
             default_source=default_source,
-            conditional_default=conditional,
             visible_when=vis if isinstance(vis, list) else None,
-            submit=True,
             description=fs.get("description") or prop.get("description") or "",
         ))
     return fields

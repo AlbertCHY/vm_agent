@@ -14,8 +14,6 @@ readonly FILES_TO_REMOVE=(
     "/tmp/set_crowdstrike.sh"
     "/tmp/expand_root_disk.sh"
     "/tmp/mount_extra_disk.sh"
-    "/tmp/sop.sh"
-    "/tmp/add_disk.sh"
     "/tmp/remover.sh"
 )
 

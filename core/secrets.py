@@ -4,13 +4,17 @@
   程式重啟後參照會失效，流程需重新產生密碼。介面保留未來替換為 Vault 等外部儲存的空間。
 - CredentialSink：新密碼的留存方式。目前為本機明文紀錄檔 (個人助手使用情境)，
   未來可替換為加密檔或公司 PAM 系統而不需改動流程程式碼。
-- AuditSink：操作稽核介面，目前為不記錄的空實作，保留未來擴充。
+- AuditSink：操作稽核介面，預設透過 logging (aria.audit) 寫入 logs/app.log，保留未來替換為外部稽核系統的空間。
 """
+import json
+import logging
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
+
+audit_logger = logging.getLogger("aria.audit")
 
 
 class SecretStore(Protocol):
@@ -93,7 +97,7 @@ def get_credential_sink() -> CredentialSink:
     if _credential_sink_factory is not None:
         return _credential_sink_factory()
     import config
-    return PlaintextFileCredentialSink(config.BOOTSTRAP_LOG_DIR / "bootstrap_credentials.log")
+    return PlaintextFileCredentialSink(config.LOG_DIR / "bootstrap_credentials.log")
 
 
 def set_credential_sink_factory(factory: Optional[Callable[[], CredentialSink]]) -> None:
@@ -107,14 +111,15 @@ class AuditSink(Protocol):
     def record(self, event: str, **details: Any) -> None: ...
 
 
-class NullAuditSink:
-    """預設不記錄；未來可替換為 JSON Lines 檔或資料庫"""
+class LoggingAuditSink:
+    """預設透過 Python logging (aria.audit) 寫入 logs/app.log"""
 
     def record(self, event: str, **details: Any) -> None:
-        return None
+        payload = json.dumps(details, ensure_ascii=False, default=str) if details else "{}"
+        audit_logger.info("event=%s %s", event, payload)
 
 
-_audit_sink: AuditSink = NullAuditSink()
+_audit_sink: AuditSink = LoggingAuditSink()
 
 
 def get_audit_sink() -> AuditSink:

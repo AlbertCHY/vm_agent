@@ -154,7 +154,7 @@ def test_resume_after_crash_continues_from_next_step(fakes):
     with pytest.raises(KeyboardInterrupt):
         agent.invoke(Command(resume={itr.id: {"action": "approve"}}), cfg)
     assert [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls] == ["add_pub_key.sh", "set_no_passwd.sh"]
-    assert agent.get_state(cfg).next  # 仍有待執行節點 → /pending 會列出
+    assert agent.get_state(cfg).next  # 仍有待執行節點，可於後續直接從斷點續跑
 
     agent.invoke(None, cfg)  # 續跑
     executed = [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls]

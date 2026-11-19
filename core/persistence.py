@@ -11,6 +11,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import nullcontext
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
@@ -65,18 +66,15 @@ def delete_thread_checkpoints(thread_id: str, checkpointer=None) -> None:
     if conn is None:
         return
     try:
-        lock = getattr(cp, "lock", None)
-        if lock:
-            with lock:
-                conn.execute("DELETE FROM checkpoints WHERE thread_id=?", (thread_id,))
-                conn.execute("DELETE FROM writes WHERE thread_id=?", (thread_id,))
-                conn.commit()
-        else:
+        with getattr(cp, "lock", None) or nullcontext():
             conn.execute("DELETE FROM checkpoints WHERE thread_id=?", (thread_id,))
             conn.execute("DELETE FROM writes WHERE thread_id=?", (thread_id,))
             conn.commit()
     except Exception:
         pass
+
+
+_SESSION_KEYS = ("thread_id", "title", "kind", "archived", "created_at", "updated_at")
 
 
 class AppStore:
@@ -105,10 +103,6 @@ class AppStore:
                 );
                 """
             )
-            try:
-                self._conn.execute("ALTER TABLE sessions ADD COLUMN archived INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass
             self._conn.commit()
 
     # ─── 對話與生命週期 Session ───
@@ -131,8 +125,7 @@ class AppStore:
             ).fetchone()
         if not row:
             return None
-        keys = ("thread_id", "title", "kind", "archived", "created_at", "updated_at")
-        return dict(zip(keys, row))
+        return dict(zip(_SESSION_KEYS, row))
 
     def archive_session(self, thread_id: str) -> None:
         with self._lock:
@@ -164,8 +157,7 @@ class AppStore:
         args.append(limit)
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
-        keys = ("thread_id", "title", "kind", "archived", "created_at", "updated_at")
-        return [dict(zip(keys, r)) for r in rows]
+        return [dict(zip(_SESSION_KEYS, r)) for r in rows]
 
     # ─── 子圖延續資料 ───
     def save_pipeline(self, session_id: str, kind: str, data: dict[str, Any]) -> None:

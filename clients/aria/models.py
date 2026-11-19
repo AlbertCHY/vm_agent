@@ -35,9 +35,7 @@ class FormField(BaseModel):
     options_source: Optional[str] = None             # 動態選項來源 (scriptAction id)
     default: Any = None                              # 常數預設值
     default_source: Optional[str] = None             # 動態預設來源 (scriptAction id)
-    conditional_default: Optional[list[dict[str, Any]]] = None
     visible_when: Optional[list[dict[str, Any]]] = None  # [{"equals": {...}, "value": bool}]
-    submit: bool = True                              # 是否屬於 catalog schema (決定是否送出)
     description: str = ""
 
     def option_for(self, raw: Any) -> Optional[FormOption]:

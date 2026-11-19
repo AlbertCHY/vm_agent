@@ -55,7 +55,7 @@ def render_request(request: dict[str, Any]) -> None:
 
 
 def handle_review(request: dict[str, Any]) -> dict[str, Any]:
-    """顯示審核畫面並收集決策 (KeyboardInterrupt 會往外拋，流程保持暫停可稍後以 /pending 繼續)"""
+    """顯示審核畫面並收集決策 (KeyboardInterrupt 會往外拋，流程保持暫停並由 CLI 自動詢問續跑或由 /jobs 繼續)"""
     console.print("\n[bold yellow]⚠️  觸發人工審查機制 (Human-In-The-Loop)[/bold yellow]")
     if request.get("message"):
         console.print(f"[yellow]{escape(request['message'])}[/yellow]")

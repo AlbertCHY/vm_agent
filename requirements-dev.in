@@ -1,4 +1,4 @@
 # 開發 / 測試用相依：
-#   uv pip compile requirements-dev.in -o requirements-dev.txt
+#   uv pip compile requirements-dev.in -o requirements-dev.txt --universal --python-version 3.12
 -c requirements.txt
 pytest>=8.0

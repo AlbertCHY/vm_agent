@@ -71,6 +71,7 @@ langchain==1.4.8
     # via -r requirements.in
 langchain-core==1.7.4
     # via
+    #   -r requirements.in
     #   langchain
     #   langchain-google-genai
     #   langgraph

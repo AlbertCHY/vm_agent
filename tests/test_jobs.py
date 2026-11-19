@@ -16,9 +16,11 @@ import cli.jobs as jobs_cli
 import cli.review as review_mod
 from helpers import build_agent_calling, drive
 from subgraphs.vm_bootstrap import nodes as boot_nodes
-from subgraphs.vm_disk import graph as disk_graph
+from subgraphs.vm_bootstrap.state import BootstrapState
+from subgraphs.vm_disk import nodes as disk_nodes
 from subgraphs.vm_disk import tool as disk_tool
 from subgraphs.vm_disk.executor import ADD_DISK, RESIZE_BOOT_DISK
+from subgraphs.vm_disk.state import DiskState
 from subgraphs.vm_lifecycle import (
     BOOTSTRAP_REVIEW,
     BOOTSTRAP_RUNNING,
@@ -28,6 +30,7 @@ from subgraphs.vm_lifecycle import (
     DONE,
     FAILED,
     SUBMITTED,
+    VMLifecycleState,
     build_vm_lifecycle_graph,
     drain_notices,
     get_lifecycle_job,
@@ -90,8 +93,8 @@ class FakeAria:
 def lc_graph(monkeypatch):
     drain_notices()
     g = build_vm_lifecycle_graph(checkpointer=InMemorySaver())
-    monkeypatch.setattr("subgraphs.vm_lifecycle.runner.get_vm_lifecycle_graph", lambda: g)
-    monkeypatch.setattr(lc_nodes, "wait_for_next_poll", lambda timeout: None)
+    monkeypatch.setattr("subgraphs.vm_lifecycle.graph.get_vm_lifecycle_graph", lambda: g)
+    monkeypatch.setattr("subgraphs.common.runner.wait_for_next_poll", lambda timeout, task_id=None: None)
     return g
 
 
@@ -111,7 +114,7 @@ def _new_job(lc_graph, **kw):
 def test_real_wait_node_transitions_and_stops_at_disk_review_without_replaying_scan(lc_graph, monkeypatch):
     """直接以 lc_graph.invoke(None, cfg) 驅動真實 wait_vm_ready 節點，並驗證 Resume 時不重跑掃描"""
     aria = FakeAria()
-    monkeypatch.setattr(disk_graph, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
     monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
 
     # 先測試送出後處於 INITIALIZATION -> APPROVAL_PENDING -> 轉為 INPROGRESS 時 wait_vm_ready 會先存檔 BUILDING Checkpoint
@@ -155,7 +158,7 @@ def test_crash_after_submit_disk_op_does_not_resubmit(lc_graph, monkeypatch):
     再從 Checkpoint 續跑，驗證 request_id 已寫入 Checkpoint，Aria 只會收到 1 次申請！
     """
     aria = FakeAria()
-    monkeypatch.setattr(disk_graph, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
     monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
     aria.deployments.dep_status["dep-1"] = [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
 
@@ -202,7 +205,7 @@ def test_submit_disk_op_idempotency_skips_existing_extra_disk(lc_graph, monkeypa
         {"id": "disk-existing", "type": "Cloud.vSphere.Disk",
          "properties": {"resourceName": "proj-demo035404-disk2-123456"}}
     ]
-    monkeypatch.setattr(disk_graph, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
     monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
     aria.deployments.dep_status["dep-1"] = [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
 
@@ -330,9 +333,8 @@ def test_consecutive_poll_errors_stops_and_notifies(lc_graph, monkeypatch):
 
 def test_adjust_vm_disk_tool_review_and_execute(monkeypatch):
     aria = FakeAria()
-    monkeypatch.setattr(disk_graph, "get_aria_client", lambda: aria)
-    monkeypatch.setattr(disk_tool, "get_aria_client", lambda: aria)
-    monkeypatch.setattr("subgraphs.vm_disk.executor.time.sleep", lambda s: None)
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(disk_nodes.time, "sleep", lambda s: None)
     agent, _ = build_agent_calling(disk_tool.adjust_vm_disk, {"ip": "10.0.0.60", "extra_disk_gb": 50})
     answers = iter([{"action": "edit", "edits": {"extra_disk_gb": "abc"}},
                     {"action": "edit", "edits": {"boot_disk_gb": "80G", "extra_disk_gb": "100"}}])
@@ -342,10 +344,79 @@ def test_adjust_vm_disk_tool_review_and_execute(monkeypatch):
     assert [(a, i["capacityGb"]) for _, a, i in aria.deployments.submitted] == [(RESIZE_BOOT_DISK, 80), (ADD_DISK, 100)]
 
 
+def test_adjust_vm_disk_tool_skips_existing_extra_disk_idempotently(monkeypatch):
+    """驗證整合後前景 adjust_vm_disk 也具備與背景一致的 Add Disk 冪等防呆"""
+    aria = FakeAria()
+    aria.deployments.extra_resources = [
+        {"id": "disk-existing", "type": "Cloud.vSphere.Disk",
+         "properties": {"resourceName": "proj-demo035404-disk2-654321"}}
+    ]
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(disk_nodes.time, "sleep", lambda s: None)
+    agent, _ = build_agent_calling(disk_tool.adjust_vm_disk, {"ip": "10.0.0.60", "extra_disk_gb": 100})
+    _, tool_msg = drive(agent, lambda req: {"action": "approve"})
+    assert tool_msg.artifact["status"] == "completed"
+    assert aria.deployments.submitted == []
+
+
+def test_foreground_wait_disk_op_retries_transient_errors_then_gives_up(monkeypatch):
+    """前景 wait_disk_op：暫時性查詢失敗會退避重試；連續失敗達上限才回報錯誤 (request_id 保留)"""
+    calls = {"n": 0}
+
+    class _Dep:
+        def get_request(self, req_id):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise ConnectionError("boom")
+            return {"status": "SUCCESSFUL"}
+
+    ops = [{"action_id": ADD_DISK, "label": "加硬碟", "status": "running", "request_id": "req-1",
+            "submitted_at": time.time(), "inputs": {}, "error": ""}]
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: type("A", (), {"deployments": _Dep()})())
+    res = disk_nodes.wait_disk_op({"ops": ops}, sleep_fn=lambda s: None)
+    assert res["ops"][0]["status"] == "success" and not res.get("error")
+
+    class _DeadDep:
+        def get_request(self, req_id):
+            raise ConnectionError("down")
+
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: type("A", (), {"deployments": _DeadDep()})())
+    res = disk_nodes.wait_disk_op({"ops": ops}, sleep_fn=lambda s: None)
+    assert "連續失敗" in res["error"] and "req-1" in res["error"]
+
+
+def test_vm_lifecycle_state_inherits_disk_and_bootstrap_fields():
+    """驗證 VMLifecycleState 透過 TypedDict 繼承完整包含 DiskState 與 BootstrapState 欄位"""
+    lc_keys = set(VMLifecycleState.__annotations__)
+    assert set(DiskState.__annotations__).issubset(lc_keys)
+    assert set(BootstrapState.__annotations__).issubset(lc_keys)
+
+
+def test_runner_per_task_wake_event_and_cleanup():
+    """驗證 Per-Task 喚醒事件互不干擾，且 cleanup_task_resources 會一併釋放鎖與快取"""
+    from subgraphs.common import runner
+
+    ev_a = runner._get_wake_event("task-a")
+    ev_b = runner._get_wake_event("task-b")
+    ev_a.clear()
+    ev_b.clear()
+    runner.get_job_lock("task-a")
+    runner.set_live_progress("task-a", {"note": "polling"})
+
+    runner.notify_poll_now("task-a")
+    assert ev_a.is_set() and not ev_b.is_set()
+
+    runner.cleanup_task_resources("task-a")
+    assert "task-a" not in runner._TASK_LOCKS
+    assert "task-a" not in runner._WAKE_EVENTS
+    assert runner.get_live_progress("task-a") == {}
+    runner.cleanup_task_resources("task-b")
+
+
 def test_background_thread_end_to_end_and_track_tool(lc_graph, monkeypatch):
     """驗證真實背景執行緒：wait_vm_ready → disk_review → submit_disk_op → wait_disk_op → bootstrap_review"""
     aria = FakeAria()
-    monkeypatch.setattr(disk_graph, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
     monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
     aria.deployments.dep_status["dep-1"] = [
         ("APPROVAL_PENDING", "CREATE_INPROGRESS"),

@@ -194,7 +194,7 @@ def build_review_fields(state: ProvisioningState) -> list[ReviewField]:
                     source=sources.get(DEPLOYMENT_NAME, "")),
     ]
     for f in _fields(state):
-        if not f.submit or not f.is_visible(values):
+        if not f.is_visible(values):
             continue
         options = ""
         if f.options:
@@ -266,7 +266,7 @@ def submitted_spec_text(state: ProvisioningState) -> str:
     sources = state.get("sources") or {}
     lines = ["**實際送出的規格**（以此為準；標示「審核修改」者為人工審查時變更的值）："]
     for f in _fields(state):
-        if not f.submit or not f.is_visible(values) or is_blank(values.get(f.id)):
+        if not f.is_visible(values) or is_blank(values.get(f.id)):
             continue
         mark = "（審核修改）" if sources.get(f.id) == SRC_USER else ""
         lines.append(f"- {f.label} [{f.id}]: {display_value(f, values.get(f.id))}{mark}")
@@ -278,7 +278,7 @@ def submit_request(state: ProvisioningState) -> dict[str, Any]:
     project = state["project"]
     template = state["template"]
     values = state.get("values") or {}
-    inputs = {f.id: values[f.id] for f in _fields(state) if f.submit and f.id in values and values[f.id] is not None}
+    inputs = {f.id: values[f.id] for f in _fields(state) if f.id in values and values[f.id] is not None}
     deployment_name = values[DEPLOYMENT_NAME]
     try:
         result = get_aria_client().catalog.submit_request(

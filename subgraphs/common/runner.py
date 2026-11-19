@@ -1,14 +1,19 @@
-"""子圖工具共用的執行輔助 (PipelineRunner)
+"""子圖共用的執行輔助 (PipelineRunner & BackgroundGraphRunner)
 
-把子圖包成 Supervisor 工具時的共同邏輯集中於此：
-- 子圖在工具內以 graph.invoke() 執行，interrupt() 會以 GraphBubbleUp 例外冒泡到 Supervisor，
-  因此工具的錯誤處理「必須」放行 GraphBubbleUp。
-- 審核恢復時，LangGraph 會重新執行整個工具函式，子圖則從中斷點續跑；
-  所以工具在呼叫子圖之前的程式碼必須是無副作用、可重複執行的 (例如只讀取資料)。
+同時支援兩種子圖執行模式：
+1. 前景同步模式 (run_pipeline)：
+   - 把子圖包成 Supervisor 工具時的共同邏輯；子圖在工具內以 graph.invoke() 執行，
+     interrupt() 會以 GraphBubbleUp 例外冒泡到 Supervisor，由介面層處理審核後恢復。
+2. 背景非同步模式 (spawn_background_graph / run_poll_loop)：
+   - 供具有長時等待節點 (如 wait_vm_ready、wait_disk_op 或未來其他非同步 API 等待) 的子圖使用。
+   - 以獨立 thread_id 在背景執行緒呼叫 graph.invoke(None, config)，直到撞到下一個審核節點的 interrupt() 或 END 自動停下。
+   - 統一管理跨子圖的 Per-Task 執行鎖 (RLock)、Per-Task 喚醒事件、背景執行緒生命週期、通知佇列與即時進度快取。
 """
 import hashlib
 import logging
+import threading
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -17,6 +22,12 @@ from langgraph.errors import GraphBubbleUp
 
 logger = logging.getLogger(__name__)
 
+MAX_CONSECUTIVE_POLL_ERRORS = 5
+
+
+# ════════════════════════════════════════════════════════════════
+# 1. 前景同步執行器 (Supervisor 工具內嵌子圖)
+# ════════════════════════════════════════════════════════════════
 
 def derive_session_id(prefix: str, tool_call_id: Optional[str]) -> str:
     """由 tool_call_id 推導穩定的 session_id (審核恢復、重新執行工具時保持一致)"""
@@ -63,3 +74,216 @@ def run_pipeline(
         logger.exception("%s 子圖執行失敗 (session=%s)", name, session_id)
         return PipelineResult("failed", session_id, f"❌ {name} 子圖執行失敗：{type(e).__name__}: {e}")
     return summarize(values)
+
+
+# ════════════════════════════════════════════════════════════════
+# 2. 背景非同步執行器 (獨立 thread_id 背景等待與推進)
+# ════════════════════════════════════════════════════════════════
+
+_STATE_LOCK = threading.Lock()
+_NOTICES: deque[str] = deque()
+_LIVE_PROGRESS: dict[str, dict[str, Any]] = {}
+_CANCELLED_TASKS: set[str] = set()
+_ACTIVE_THREADS: dict[str, threading.Thread] = {}
+_TASK_LOCKS: dict[str, threading.RLock] = {}
+_WAKE_EVENTS: dict[str, threading.Event] = {}
+
+
+def _get_wake_event(task_id: str) -> threading.Event:
+    with _STATE_LOCK:
+        ev = _WAKE_EVENTS.get(task_id)
+        if ev is None:
+            ev = threading.Event()
+            _WAKE_EVENTS[task_id] = ev
+        return ev
+
+
+def push_notice(message: str) -> None:
+    """將背景子圖的通知推入佇列，供 CLI 於下一次輸入提示前顯示"""
+    with _STATE_LOCK:
+        _NOTICES.append(message)
+
+
+def drain_notices() -> list[str]:
+    """取出並清空目前所有背景通知"""
+    with _STATE_LOCK:
+        items = list(_NOTICES)
+        _NOTICES.clear()
+    return items
+
+
+def set_live_progress(task_id: str, updates: dict[str, Any]) -> None:
+    if not task_id:
+        return
+    with _STATE_LOCK:
+        _LIVE_PROGRESS[task_id] = dict(updates)
+
+
+def get_live_progress(task_id: str) -> dict[str, Any]:
+    with _STATE_LOCK:
+        return dict(_LIVE_PROGRESS.get(task_id) or {})
+
+
+def clear_live_progress(task_id: str) -> None:
+    with _STATE_LOCK:
+        _LIVE_PROGRESS.pop(task_id, None)
+
+
+def mark_cancelled(task_id: str) -> None:
+    with _STATE_LOCK:
+        _CANCELLED_TASKS.add(task_id)
+        ev = _WAKE_EVENTS.get(task_id)
+    if ev is not None:
+        ev.set()
+
+
+def clear_cancelled(task_id: str) -> None:
+    with _STATE_LOCK:
+        _CANCELLED_TASKS.discard(task_id)
+
+
+def is_cancelled(task_id: str) -> bool:
+    with _STATE_LOCK:
+        return task_id in _CANCELLED_TASKS
+
+
+def notify_poll_now(task_id: Optional[str] = None) -> None:
+    """喚醒指定背景任務 (不指定時喚醒全部) 立即執行下一次檢查"""
+    with _STATE_LOCK:
+        if task_id:
+            ev = _WAKE_EVENTS.get(task_id)
+            events = [ev] if ev is not None else []
+        else:
+            events = list(_WAKE_EVENTS.values())
+    for ev in events:
+        ev.set()
+
+
+def wait_for_next_poll(timeout: float, task_id: Optional[str] = None) -> None:
+    """背景等待節點專用的可中斷睡眠 (Per-Task Event，避免多任務競爭與誤喚醒)"""
+    ev = _get_wake_event(task_id or "__global__")
+    ev.wait(timeout)
+    ev.clear()
+
+
+def get_job_lock(task_id: str) -> threading.RLock:
+    """取得指定背景任務的專屬鎖，避免前景審核與背景輪詢同時操作同一個 thread_id"""
+    with _STATE_LOCK:
+        lock = _TASK_LOCKS.get(task_id)
+        if lock is None:
+            lock = threading.RLock()
+            _TASK_LOCKS[task_id] = lock
+        return lock
+
+
+def cleanup_task_resources(task_id: str) -> None:
+    """清理已封存或取消任務的記憶體快取、喚醒事件與執行鎖"""
+    with _STATE_LOCK:
+        _LIVE_PROGRESS.pop(task_id, None)
+        _CANCELLED_TASKS.discard(task_id)
+        _WAKE_EVENTS.pop(task_id, None)
+        t = _ACTIVE_THREADS.get(task_id)
+        if not (t and t.is_alive()):
+            _TASK_LOCKS.pop(task_id, None)
+
+
+def is_background_running(task_id: str) -> bool:
+    with _STATE_LOCK:
+        t = _ACTIVE_THREADS.get(task_id)
+        return bool(t and t.is_alive())
+
+
+def wait_for_background(task_id: str, timeout: float = 5.0) -> bool:
+    """等待指定任務的背景執行緒收尾結束；回傳 True 代表背景已完全停止"""
+    with _STATE_LOCK:
+        t = _ACTIVE_THREADS.get(task_id)
+    if t and t.is_alive() and t is not threading.current_thread():
+        t.join(timeout=timeout)
+    return not is_background_running(task_id)
+
+
+def run_poll_loop(
+    task_id: str,
+    label: str,
+    interval: float,
+    max_backoff: float,
+    poll_once: Callable[[dict[str, Any]], Optional[dict[str, Any]]],
+    initial_progress: dict[str, Any],
+    wait_fn: Optional[Callable[[float], None]] = None,
+    max_errors: int = MAX_CONSECUTIVE_POLL_ERRORS,
+    error_label: str = "輪詢",
+    cancelled_result: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    通用的背景輪詢迴圈骨架：
+    - poll_once(current) 回傳非 None dict 時代表狀態轉變或完成，清除即時進度並回傳寫入 Checkpoint；
+      回傳 None 代表繼續等待 (更新即時進度後進入可中斷睡眠)。
+    - 遇例外時記錄連續錯誤、更新即時進度、採指數退避；遇 401/403 或達 max_errors 時推播通知並重新拋出。
+    - 偵測到取消旗標時清理快取並回傳 cancelled_result。
+    """
+    wait = wait_fn or (lambda timeout: wait_for_next_poll(timeout, task_id=task_id))
+    current: dict[str, Any] = dict(initial_progress)
+    consecutive_errors = 0
+
+    while not is_cancelled(task_id):
+        try:
+            result = poll_once(current)
+            consecutive_errors = 0
+            if result is not None:
+                clear_live_progress(task_id)
+                return result
+            set_live_progress(task_id, current)
+        except Exception as e:
+            consecutive_errors += 1
+            logger.exception("追蹤工作 %s %s失敗 (%d/%d)", task_id, error_label, consecutive_errors, max_errors)
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            current["note"] = f"上次查詢失敗 ({consecutive_errors}/{max_errors})：{type(e).__name__}: {e}"
+            set_live_progress(task_id, current)
+            if status_code in (401, 403) or consecutive_errors >= max_errors:
+                push_notice(
+                    f"⚠️ {label} 連續查詢失敗 ({type(e).__name__}: {e})，已暫停背景輪詢 — 請於 /jobs 按 [C] 重試"
+                )
+                raise
+            backoff = min(interval * (2 ** (consecutive_errors - 1)), max_backoff)
+            wait(backoff)
+            continue
+
+        wait(interval)
+
+    clear_live_progress(task_id)
+    clear_cancelled(task_id)
+    return dict(cancelled_result or {"sub_stage": "cancelled", "note": "使用者停止追蹤"})
+
+
+def spawn_background_graph(
+    task_id: str,
+    graph: Any,
+    run_config: dict[str, Any],
+    name_prefix: str = "lg-bg",
+) -> None:
+    """
+    在背景 Daemon 執行緒中呼叫 graph.invoke(None, config=run_config)，
+    推進等待節點直到遇到下一個人工審核 interrupt() 或 END 自動結束並釋放執行緒。
+    """
+    task_lock = get_job_lock(task_id)
+
+    with _STATE_LOCK:
+        existing = _ACTIVE_THREADS.get(task_id)
+        if existing and existing.is_alive():
+            return
+
+        def _runner():
+            try:
+                with task_lock:
+                    graph.invoke(None, config=run_config)
+            except Exception as e:
+                logger.exception("背景子圖推進失敗 (task=%s)", task_id)
+                set_live_progress(task_id, {"note": f"背景推進暫停 ({type(e).__name__}: {e}) — 可於 /jobs 按 [C] 重試"})
+            finally:
+                clear_cancelled(task_id)
+                with _STATE_LOCK:
+                    _ACTIVE_THREADS.pop(task_id, None)
+
+        t = threading.Thread(target=_runner, name=f"{name_prefix}-{task_id}", daemon=True)
+        _ACTIVE_THREADS[task_id] = t
+        t.start()

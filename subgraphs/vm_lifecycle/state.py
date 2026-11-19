@@ -5,11 +5,10 @@
 """
 import time
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Optional
+from typing import Any, Optional
 
-from langchain_core.messages import BaseMessage
-from langgraph.graph.message import add_messages
-from typing_extensions import TypedDict
+from subgraphs.vm_bootstrap.state import BootstrapState
+from subgraphs.vm_disk.state import DiskState
 
 SUBMITTED = "submitted"
 BUILDING = "building"
@@ -36,53 +35,20 @@ STAGE_LABELS = {
 }
 
 
-class VMLifecycleState(TypedDict, total=False):
-    messages: Annotated[list[BaseMessage], add_messages]
+class VMLifecycleState(DiskState, BootstrapState, total=False):
+    """繼承 DiskState 與 BootstrapState，僅宣告生命週期專屬欄位"""
     # ─── 1. 開機申請送出後的基礎識別資訊 ───
     job_id: str
-    deployment_id: str
     deployment_name: str
     project: str
     template: str
     os_image: str
     is_linux: bool
-    boot_disk_gb: Optional[int]
-    extra_disk_gb: Optional[int]
 
     # ─── 2. 階段追蹤與等待資訊 ───
     sub_stage: str                     # "submitted" | "building" | "ready" | "cancelled"
     stage_since: float
-    last_checked: float
     overdue: bool
-    note: str
-    error: str
-
-    # ─── 3. 機器定位與 Day-2 硬碟調整欄位 ───
-    vm_name: str
-    machine_id: str
-    ip: str
-    notes: list[str]
-    errors: list[str]
-    blocking: list[str]
-    ops: list[dict[str, Any]]
-
-    # ─── 4. Bootstrap 初始設定欄位 ───
-    hostname: Optional[str]
-    cs_mode: str
-    skip_disk: bool
-    init_user: str
-    user1: str
-    user2: str
-    secret_ref: Optional[str]
-    human_feedback: Optional[dict[str, Any]]
-    validation_errors: list[str]
-    login_mode: str
-    credentials_saved: bool
-    credentials_location: Optional[str]
-    step_index: int
-    step_results: list[dict[str, Any]]
-    stopped: bool
-    execution_result: Optional[dict[str, Any]]
 
 
 @dataclass
@@ -123,6 +89,8 @@ class LifecycleJob:
             "job_id": self.id,
             "deployment_name": self.deployment_name,
             "project": self.project,
+            "template": self.template,
+            "os_image": self.os_image,
             "stage": self.stage,
             "stage_label": self.stage_label,
             "vm_name": self.vm_name,

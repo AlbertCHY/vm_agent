@@ -1,21 +1,27 @@
 """純 LangGraph 驅動的 VM 生命週期子圖 (等待建立 → 硬碟調整 → 初始設定)"""
-from subgraphs.vm_lifecycle.graph import build_vm_lifecycle_graph
-from subgraphs.vm_lifecycle.nodes import drain_notices, notify_poll_now, push_notice
-from subgraphs.vm_lifecycle.runner import (
+from subgraphs.common.runner import (
+    drain_notices,
+    get_job_lock,
+    is_background_running,
+    notify_poll_now,
+    push_notice,
+    wait_for_background,
+)
+from subgraphs.vm_lifecycle.graph import (
+    build_vm_lifecycle_graph,
+    get_vm_lifecycle_graph,
+)
+from subgraphs.vm_lifecycle.service import (
     LIFECYCLE_KIND,
     archive_lifecycle_job,
     cancel_lifecycle_job,
-    get_job_lock,
     get_lifecycle_job,
-    get_vm_lifecycle_graph,
-    is_background_running,
     lifecycle_config,
     list_lifecycle_jobs,
     prepare_bootstrap_retry,
     resume_waiting_lifecycles,
     spawn_background_continuation,
     start_lifecycle_job,
-    wait_for_background,
 )
 from subgraphs.vm_lifecycle.state import (
     BOOTSTRAP_REVIEW,

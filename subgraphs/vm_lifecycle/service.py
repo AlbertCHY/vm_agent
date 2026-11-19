@@ -1,30 +1,24 @@
-"""VM 生命週期子圖執行管理 (純 LangGraph Checkpointer 驅動)
+"""VM 生命週期管理服務：Checkpoint 階段推導、Job 查詢/建立/重試/封存/取消與啟動恢復
 
-負責：
-- 建立並初始化 VM 生命週期子圖的 Checkpoint (start_lifecycle_job)
-- 啟動背景執行緒推進等待節點 (spawn_background_continuation)，並提供 Per-Job 執行鎖避免前景與背景競態
-- 從 LangGraph Checkpointer 直接推導目前各 VM 的階段與狀態 (get_lifecycle_job / list_lifecycle_jobs)
-- CLI 啟動時自動恢復上次未完成的背景等待節點 (resume_waiting_lifecycles)
+負責所有 VMLifecycleGraph 的外部管理操作；圖形拓樸組裝見 subgraphs/vm_lifecycle/graph.py，
+底層背景執行緒、鎖與通知佇列統一使用 subgraphs/common/runner.py。
 """
-import logging
-import threading
 import time
 import uuid
-from functools import lru_cache
 from typing import Any, Optional
 
 from core.persistence import delete_thread_checkpoints, get_app_store
-from subgraphs.vm_lifecycle.graph import build_vm_lifecycle_graph
-from subgraphs.vm_lifecycle.nodes import (
-    clear_cancelled,
-    clear_live_progress,
-    drain_notices,
+from subgraphs.common.runner import (
+    cleanup_task_resources,
     get_live_progress,
+    is_background_running,
     mark_cancelled,
-    notify_poll_now,
     push_notice,
-    set_live_progress,
+    spawn_background_graph,
+    wait_for_background,
 )
+from subgraphs.vm_lifecycle import graph as lifecycle_graph
+from subgraphs.vm_lifecycle.nodes import lifecycle_prepare_bootstrap
 from subgraphs.vm_lifecycle.state import (
     BOOTSTRAP_REVIEW,
     BOOTSTRAP_RUNNING,
@@ -39,19 +33,8 @@ from subgraphs.vm_lifecycle.state import (
     LifecycleJob,
 )
 
-logger = logging.getLogger(__name__)
-
 LIFECYCLE_KIND = "vm_lifecycle"
 THREAD_PREFIX = "vmjob-"
-
-_BG_LOCK = threading.Lock()
-_ACTIVE_THREADS: dict[str, threading.Thread] = {}
-_JOB_LOCKS: dict[str, threading.RLock] = {}
-
-
-@lru_cache(maxsize=1)
-def get_vm_lifecycle_graph():
-    return build_vm_lifecycle_graph()
 
 
 def thread_id_for(job_id: str) -> str:
@@ -64,33 +47,6 @@ def job_id_from(thread_id: str) -> str:
 
 def lifecycle_config(job_id_or_thread_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": thread_id_for(job_id_or_thread_id)}, "recursion_limit": 60}
-
-
-def get_job_lock(job_id: str) -> threading.RLock:
-    jid = job_id_from(job_id)
-    with _BG_LOCK:
-        lock = _JOB_LOCKS.get(jid)
-        if lock is None:
-            lock = threading.RLock()
-            _JOB_LOCKS[jid] = lock
-        return lock
-
-
-def is_background_running(job_id: str) -> bool:
-    jid = job_id_from(job_id)
-    with _BG_LOCK:
-        t = _ACTIVE_THREADS.get(jid)
-        return bool(t and t.is_alive())
-
-
-def wait_for_background(job_id: str, timeout: float = 5.0) -> bool:
-    """等待該 job 的背景執行緒收尾結束；回傳 True 代表背景已完全停止"""
-    jid = job_id_from(job_id)
-    with _BG_LOCK:
-        t = _ACTIVE_THREADS.get(jid)
-    if t and t.is_alive() and t is not threading.current_thread():
-        t.join(timeout=timeout)
-    return not is_background_running(jid)
 
 
 def _derive_stage(
@@ -106,7 +62,6 @@ def _derive_stage(
     if "wait_vm_ready" in next_nodes:
         return BUILDING if values.get("sub_stage") == BUILDING else SUBMITTED
     if "disk_locate" in next_nodes:
-        # 若背景執行緒剛結束 wait_vm_ready 正在跑 disk_locate，尚未停在 disk_review 的 interrupt，仍視為建立收尾中
         return BUILDING if bg_running else DISK_REVIEW
     if "disk_review" in next_nodes:
         return BUILDING if (bg_running and not has_interrupts) else DISK_REVIEW
@@ -168,7 +123,7 @@ def get_lifecycle_job(job_id: str, graph=None) -> Optional[LifecycleJob]:
     jid = job_id_from(job_id)
     tid = thread_id_for(jid)
     sess = get_app_store().get_session(tid)
-    g = graph or get_vm_lifecycle_graph()
+    g = graph or lifecycle_graph.get_vm_lifecycle_graph()
     state = g.get_state(lifecycle_config(tid))
     return _snapshot_to_job(jid, tid, state, archived=bool((sess or {}).get("archived")))
 
@@ -178,7 +133,7 @@ def list_lifecycle_jobs(
     include_archived: bool = False,
     graph=None,
 ) -> list[LifecycleJob]:
-    g = graph or get_vm_lifecycle_graph()
+    g = graph or lifecycle_graph.get_vm_lifecycle_graph()
     sessions = get_app_store().list_sessions(limit=200, kind=LIFECYCLE_KIND, include_archived=include_archived)
     jobs: list[LifecycleJob] = []
     for s in sessions:
@@ -198,32 +153,11 @@ def list_lifecycle_jobs(
 
 
 def spawn_background_continuation(job_id: str, graph=None) -> None:
-    """在背景執行緒呼叫 graph.invoke(None, cfg)，推進 wait_* 節點直到遇到下一個 interrupt() 或 END 自動結束"""
+    """委派給 subgraphs.common.runner.spawn_background_graph 在背景執行緒推進子圖"""
     jid = job_id_from(job_id)
     tid = thread_id_for(jid)
-    g = graph or get_vm_lifecycle_graph()
-    job_lock = get_job_lock(jid)
-
-    with _BG_LOCK:
-        existing = _ACTIVE_THREADS.get(jid)
-        if existing and existing.is_alive():
-            return
-
-        def _runner():
-            try:
-                with job_lock:
-                    g.invoke(None, config=lifecycle_config(tid))
-            except Exception as e:
-                logger.exception("VM 生命週期子圖背景推進失敗 (job=%s)", jid)
-                set_live_progress(jid, {"note": f"背景推進暫停 ({type(e).__name__}: {e}) — 可於 /jobs 按 [C] 重試"})
-            finally:
-                clear_cancelled(jid)
-                with _BG_LOCK:
-                    _ACTIVE_THREADS.pop(jid, None)
-
-        t = threading.Thread(target=_runner, name=f"lg-lifecycle-{jid}", daemon=True)
-        _ACTIVE_THREADS[jid] = t
-        t.start()
+    g = graph or lifecycle_graph.get_vm_lifecycle_graph()
+    spawn_background_graph(jid, g, lifecycle_config(tid), name_prefix="lg-lifecycle")
 
 
 def start_lifecycle_job(
@@ -238,15 +172,10 @@ def start_lifecycle_job(
     auto_start: bool = True,
     graph=None,
 ) -> LifecycleJob:
-    """
-    建立新的 VM 生命週期子圖執行個體：
-    1. 以 update_state(..., as_node='init_lifecycle') 同步寫入初始 Checkpoint (state.next == ('wait_vm_ready',))
-    2. 若 auto_start=True，立即在背景執行緒啟動 graph.invoke(None, cfg) 執行 wait_vm_ready
-    """
     jid = uuid.uuid4().hex[:8]
     tid = thread_id_for(jid)
     now = time.time()
-    g = graph or get_vm_lifecycle_graph()
+    g = graph or lifecycle_graph.get_vm_lifecycle_graph()
     cfg = lifecycle_config(tid)
 
     initial_state: dict[str, Any] = {
@@ -281,21 +210,14 @@ def start_lifecycle_job(
 
 
 def prepare_bootstrap_retry(job_id: str, error: str = "", graph=None) -> None:
-    """
-    當初始設定執行失敗 (例如 SSH 尚未就緒，或某一步驟失敗) 時：
-    - 保留既有的 secret_ref、login_mode、credentials_saved 與已成功的步驟進度
-    - 若尚未進入步驟 (connect_and_upload 失敗)，退回 bootstrap_review 讓使用者可稍後重試
-    - 若在 run_step 某一步驟失敗，將 step_index 退回該失敗步驟並停在 run_step，下次進 /jobs 可直接從該步驟續跑
-    """
     jid = job_id_from(job_id)
     tid = thread_id_for(jid)
-    g = graph or get_vm_lifecycle_graph()
+    g = graph or lifecycle_graph.get_vm_lifecycle_graph()
     cfg = lifecycle_config(tid)
     state = g.get_state(cfg)
     vals = dict(state.values or {})
     steps = list(vals.get("step_results") or [])
 
-    # 檢查是否有失敗的一般步驟 (不含 cleanup)
     failed_idx = None
     for i, sr in enumerate(steps):
         if sr.get("status") == "failed" and not sr.get("id"):
@@ -303,7 +225,6 @@ def prepare_bootstrap_retry(job_id: str, error: str = "", graph=None) -> None:
             break
 
     if failed_idx is not None:
-        # 保留前面已成功的步驟與 secret_ref，將狀態停在 run_step 供下次直接續跑
         kept_steps = steps[:failed_idx]
         g.update_state(
             cfg,
@@ -319,8 +240,6 @@ def prepare_bootstrap_retry(job_id: str, error: str = "", graph=None) -> None:
         )
         return
 
-    # 連線或上傳階段就失敗：保留既有 secret_ref 退回 prepare_bootstrap → bootstrap_review
-    from subgraphs.vm_lifecycle.nodes import lifecycle_prepare_bootstrap
     seeded = {**vals, "error": "", "note": error, "execution_result": None, "step_results": [], "step_index": 0}
     prep = lifecycle_prepare_bootstrap(seeded)
     g.update_state(cfg, {**prep, "error": "", "note": error}, as_node="prepare_bootstrap")
@@ -330,8 +249,7 @@ def prepare_bootstrap_retry(job_id: str, error: str = "", graph=None) -> None:
 def archive_lifecycle_job(job_id: str, graph=None) -> None:
     jid = job_id_from(job_id)
     tid = thread_id_for(jid)
-    clear_live_progress(jid)
-    clear_cancelled(jid)
+    cleanup_task_resources(jid)
     get_app_store().archive_session(tid)
     cp = getattr(graph, "checkpointer", None) if graph else None
     delete_thread_checkpoints(tid, checkpointer=cp)
@@ -339,19 +257,13 @@ def archive_lifecycle_job(job_id: str, graph=None) -> None:
 
 def cancel_lifecycle_job(job_id: str, graph=None) -> None:
     jid = job_id_from(job_id)
-    tid = thread_id_for(jid)
     mark_cancelled(jid)
     wait_for_background(jid, timeout=2.0)
-    clear_live_progress(jid)
-    clear_cancelled(jid)
-    get_app_store().archive_session(tid)
-    cp = getattr(graph, "checkpointer", None) if graph else None
-    delete_thread_checkpoints(tid, checkpointer=cp)
+    archive_lifecycle_job(jid, graph=graph)
 
 
 def resume_waiting_lifecycles(graph=None) -> None:
-    """CLI 啟動時：自動為停在 wait_* / submit_disk_op 節點的生命週期子圖重新啟動背景執行緒，並提示待審核工作數量"""
-    g = graph or get_vm_lifecycle_graph()
+    g = graph or lifecycle_graph.get_vm_lifecycle_graph()
     jobs = list_lifecycle_jobs(graph=g)
     waiting_reviews = [j for j in jobs if j.stage in REVIEW_STAGES]
     if waiting_reviews:

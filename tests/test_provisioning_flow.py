@@ -91,7 +91,7 @@ def aria(monkeypatch):
     fake = FakeAria()
     monkeypatch.setattr(nodes, "get_aria_client", lambda: fake)
     # 測試時不啟動實際背景執行緒輪詢，確保初始狀態可確定性檢查
-    monkeypatch.setattr("subgraphs.vm_lifecycle.runner.spawn_background_continuation", lambda *a, **k: None)
+    monkeypatch.setattr("subgraphs.vm_lifecycle.service.spawn_background_continuation", lambda *a, **k: None)
     return fake
 
 

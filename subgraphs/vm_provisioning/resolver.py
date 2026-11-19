@@ -230,7 +230,7 @@ def validate_values(
     if is_blank(values.get(DEPLOYMENT_NAME)):
         missing.append("部署名稱 [deploymentName]")
     for f in fields:
-        if not f.submit or not f.is_visible(values):
+        if not f.is_visible(values):
             continue
         v = values.get(f.id)
         if f.required and is_blank(v):

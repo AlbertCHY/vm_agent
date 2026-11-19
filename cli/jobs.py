@@ -219,7 +219,7 @@ def handle_jobs(graph=None) -> None:
             default="",
         ).upper()
         if act == "C":
-            notify_poll_now()
+            notify_poll_now(job.id)
             spawn_background_continuation(job.id, graph=g)
             console.print("[dim]已要求背景節點立即重新檢查。[/dim]")
         elif act == "X":

@@ -1,4 +1,4 @@
-"""VM 生命週期統一子圖 (VMLifecycleGraph)
+"""VM 生命週期統一子圖 (VMLifecycleGraph) 拓樸組裝與編譯
 
 串聯：
     init_lifecycle → wait_vm_ready
@@ -6,14 +6,10 @@
       → (prepare_bootstrap → bootstrap_review [interrupt] → connect_and_upload → run_step [單步迴圈] → cleanup → bootstrap_finalize)
       → END
 
-設計重點：
-1. 等待節點 (wait_vm_ready / wait_disk_op) 與審核節點 (disk_review / bootstrap_review) 嚴格分離，
-   確保 Resume 時只重跑審核節點，不會重跑前面的狀態掃描。
-2. 硬碟動作拆分為 submit_disk_op (送出後立即寫入 request_id 至 Checkpoint) 與 wait_disk_op (只輪詢狀態)，
-   徹底防止在動作執行中重啟導致重複送出硬碟申請。
-3. disk_finalize 設定於 interrupt_after：使用者於 /jobs 核准硬碟調整後，
-   disk_finalize 組完 ops 清單即暫停並釋放前景 CLI，交由背景執行緒跑 submit_disk_op → wait_disk_op。
+Job 查詢、啟動、重試與封存等管理介面見 subgraphs/vm_lifecycle/service.py。
 """
+from functools import lru_cache
+
 from langgraph.graph import END, START, StateGraph
 
 from core.persistence import get_checkpointer
@@ -148,3 +144,8 @@ def build_vm_lifecycle_graph(checkpointer=None):
         checkpointer=checkpointer or get_checkpointer(),
         interrupt_after=["disk_finalize"],
     )
+
+
+@lru_cache(maxsize=1)
+def get_vm_lifecycle_graph():
+    return build_vm_lifecycle_graph()

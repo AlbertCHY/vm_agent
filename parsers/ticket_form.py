@@ -13,6 +13,7 @@ def preprocess_ticket(raw_text: str) -> dict[str, Any]:
     if not raw_text or not isinstance(raw_text, str):
         return {
             "單號": "未提供",
+            "申請類別": "未提供",
             "申請人": "未提供",
             "申請人工號": "未提供",
             "申請單位": "未提供",
@@ -48,6 +49,7 @@ def preprocess_ticket(raw_text: str) -> dict[str, Any]:
     # 1. 基本資訊與單號
     title_section = extract_section(r"伺服器資源申請與歸還", r"\n簽核節點記錄")
     cleaned_info["單號"] = extract_field(r"單號[：:\s]+([A-Za-z0-9_-]+)", title_section, "未提供")
+    cleaned_info["申請類別"] = extract_field(r"申請類別[\t ]+([^\n\t]+)", normalized_text, "未提供")
 
     # 2. 申請人資訊
     applier_section = extract_section(r"使用者信息", r"\n申請內容")

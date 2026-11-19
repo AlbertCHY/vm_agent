@@ -1,5 +1,9 @@
+import json
+
 from conftest import FIXTURES
+from clients.ollama_client import OllamaClient
 from parsers.ticket_form import preprocess_ticket
+from parsers.ticket_parser import parse_ticket
 
 
 def test_preprocess_sample_ticket():
@@ -20,6 +24,7 @@ def test_preprocess_sample_ticket():
 def test_preprocess_empty_input():
     info = preprocess_ticket("")
     assert info["單號"] == "未提供"
+    assert info["申請類別"] == "未提供"
     assert info["資源總計"]["VM總數"] == 1
 
 
@@ -27,3 +32,30 @@ def test_preprocess_non_form_text():
     info = preprocess_ticket("請幫我開一台 Ubuntu VM")
     assert info["單號"] == "未提供"
     assert info["審核覆寫意見"] == []
+
+
+def test_parse_ticket_uses_form_fallback_and_structured_hint():
+    captured: dict[str, str] = {}
+
+    class FakeOllama(OllamaClient):
+        def generate_json(self, system: str, prompt: str, schema=None) -> str:
+            captured["prompt"] = prompt
+            return json.dumps({
+                "ticket_id": "",
+                "applicant": "",
+                "department": "",
+                "ticket_type": "CREATE_VM",
+                "summary": "開立測試主機",
+                "approval_notes": "",
+                "action_items": [{"vm_name": "proj-demo-AP01", "cpu": 4}],
+            })
+
+    raw = (FIXTURES / "sample_ticket.txt").read_text(encoding="utf-8")
+    ticket = parse_ticket(raw, source_name="sample_ticket.txt", ollama_client=FakeOllama())
+    assert "【資源管理人】" in captured["prompt"]
+    assert ticket.ticket_id == "REQ26010100001"
+    assert ticket.applicant == "王小明"
+    assert ticket.department == "資訊服務處"
+    assert ticket.ticket_type == "CREATE_VM"
+    assert "請先以地端資源開立" in (ticket.approval_notes or "")
+    assert ticket.action_items[0]["description"] == "vm_name: proj-demo-AP01，cpu: 4"

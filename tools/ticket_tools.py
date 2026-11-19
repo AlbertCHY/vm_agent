@@ -10,7 +10,7 @@ from typing import Any, Optional
 from langchain_core.tools import tool
 
 import config
-from clients.ollama_client import get_ollama_client, TicketParseError
+from parsers.ticket_parser import TicketParseError, parse_ticket
 from schemas import ParsedTicket
 
 # 解析結果快取：key = (絕對路徑, mtime_ns)，避免同一份未變更的工單重複送 Ollama
@@ -73,7 +73,7 @@ def parse_ticket_file(path: Path, use_cache: bool = True) -> ParsedTicket:
     key = (str(path.resolve()), path.stat().st_mtime_ns)
     if use_cache and key in _PARSE_CACHE:
         return _PARSE_CACHE[key]
-    ticket = get_ollama_client().parse_ticket(_read_text(path), source_name=path.name)
+    ticket = parse_ticket(_read_text(path), source_name=path.name)
     _PARSE_CACHE[key] = ticket
     return ticket
 

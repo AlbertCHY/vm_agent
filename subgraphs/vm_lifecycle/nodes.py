@@ -119,14 +119,10 @@ def poll_deployment_once(
             return "waiting", updates, notices
 
         needs_disk = bool(state.get("boot_disk_gb") or state.get("extra_disk_gb"))
-        is_linux = state.get("is_linux", True)
         if needs_disk:
             tail = "等待「② 硬碟調整」審核 — 輸入 /jobs 處理"
-        elif is_linux:
-            tail = "等待「③ 初始設定」審核 — 輸入 /jobs 處理"
         else:
-            tail = "流程完成 (Windows 需手動初始設定)"
-        win_note = "Windows 尚未支援自動初始設定，請手動完成" if (not needs_disk and not is_linux) else ""
+            tail = "等待「③ 初始設定」審核 — 輸入 /jobs 處理"
         notices.append(f"🔔 {dep_name} 已建立完成 ({info['ip']})，{tail}")
         return (
             "ready",
@@ -137,7 +133,7 @@ def poll_deployment_once(
                 "sub_stage": "ready",
                 "stage_since": now,
                 "overdue": False,
-                "note": win_note,
+                "note": "",
                 "error": "",
                 "last_checked": now,
             },
@@ -226,9 +222,7 @@ def route_after_build(state: VMLifecycleState) -> str:
         return "wait_vm_ready"
     if state.get("boot_disk_gb") or state.get("extra_disk_gb"):
         return "disk_locate"
-    if state.get("is_linux", True):
-        return "prepare_bootstrap"
-    return END
+    return "prepare_bootstrap"
 
 
 # 2. 硬碟調整：定位 → 人工審核 (interrupt) → 產出 ops 清單 (interrupt_after) → 送出單一動作 (submit_disk_op) → 等待單一動作 (wait_disk_op)
@@ -264,7 +258,7 @@ def disk_review(state: VMLifecycleState) -> dict[str, Any]:
 def route_disk_review(state: VMLifecycleState) -> str:
     action = (state.get("human_feedback") or {}).get("action")
     if action == "skip":
-        return "prepare_bootstrap" if state.get("is_linux", True) else END
+        return "prepare_bootstrap"
     if state.get("errors") or state.get("blocking"):
         return "disk_review"
     return "disk_finalize"
@@ -274,11 +268,10 @@ def disk_finalize(state: VMLifecycleState) -> dict[str, Any]:
     ops = build_ops(state.get("vm_name") or "", state.get("boot_disk_gb"), state.get("extra_disk_gb"))
     now = time.time()
     if not ops:
-        win_note = "Windows 尚未支援自動初始設定，請手動完成" if not state.get("is_linux", True) else "沒有需要執行的硬碟動作"
         return {
             "ops": [],
             "execution_result": None,
-            "note": win_note,
+            "note": "沒有需要執行的硬碟動作",
             "error": "",
             "stage_since": now,
             "overdue": False,
@@ -296,9 +289,7 @@ def disk_finalize(state: VMLifecycleState) -> dict[str, Any]:
 def route_after_disk_finalize(state: VMLifecycleState) -> str:
     if state.get("ops"):
         return "submit_disk_op"
-    if state.get("is_linux", True):
-        return "prepare_bootstrap"
-    return END
+    return "prepare_bootstrap"
 
 
 def submit_disk_op(state: VMLifecycleState) -> dict[str, Any]:
@@ -311,7 +302,7 @@ def route_after_submit_disk_op(state: VMLifecycleState) -> str:
         return END
     ops = state.get("ops") or []
     if all(op.get("status") == "success" for op in ops):
-        return "prepare_bootstrap" if state.get("is_linux", True) else END
+        return "prepare_bootstrap"
     return "wait_disk_op"
 
 
@@ -335,13 +326,10 @@ def wait_disk_op(state: VMLifecycleState, sleep_fn: Optional[Callable[[float], N
         if outcome == "success":
             all_done = all(x.get("status") == "success" for x in updated_ops)
             if all_done:
-                is_linux = state.get("is_linux", True)
-                tail = "等待「③ 初始設定」審核 — 輸入 /jobs 處理" if is_linux else "流程完成"
-                win_note = "Windows 尚未支援自動初始設定，請手動完成" if not is_linux else "硬碟調整完成"
-                push_notice(f"🔔 {dep_name} 硬碟調整完成，{tail}")
+                push_notice(f"🔔 {dep_name} 硬碟調整完成，等待「③ 初始設定」審核 — 輸入 /jobs 處理")
                 return {
                     "ops": updated_ops,
-                    "note": win_note,
+                    "note": "硬碟調整完成",
                     "stage_since": now,
                     "overdue": False,
                     "last_checked": now,
@@ -381,15 +369,14 @@ def route_disk_op(state: VMLifecycleState) -> str:
         return "wait_disk_op"
     if any(op.get("status") != "success" for op in ops):
         return "submit_disk_op"
-    if state.get("is_linux", True):
-        return "prepare_bootstrap"
-    return END
+    return "prepare_bootstrap"
 
 
 # 3. 初始設定 (Bootstrap)：準備 → 人工審核 (interrupt) → 上傳與逐步執行 → 清理 → 報告
 def lifecycle_prepare_bootstrap(state: VMLifecycleState) -> dict[str, Any]:
     seeded: VMLifecycleState = {
         **state,
+        "os_type": state.get("os_type") or ("linux" if state.get("is_linux", True) else "windows"),
         "hostname": state.get("hostname") or state.get("deployment_name") or state.get("vm_name"),
         "cs_mode": state.get("cs_mode") or config.CROWDSTRIKE_DEFAULT_MODE,
         "skip_disk": bool(state.get("skip_disk", False)),

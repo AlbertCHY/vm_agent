@@ -13,7 +13,7 @@
 | **本地 Ollama 工單解析** | 掃描 `tickets/` 或以 `/paste` 貼上工單純文字，經表單預處理器擷取欄位提示後由本地 Ollama 判斷工單類型（`CREATE_VM` 等）並拆解 `action_items` |
 | **VM 開立申請（Provisioning）** | 動態讀取 Aria Service Broker Catalog Schema 與 Custom Form，結合 LLM 意圖抽取與確定性規則（`policies/vm_defaults.toml`），經人工審核後送出申請 |
 | **Day-2 硬碟調整（Disk）** | 支援擴充系統碟（Resize Boot Disk）與加掛額外硬碟（Add Disk），具備人工審核、單動作 Checkpoint 保護與 Add Disk 冪等防呆 |
-| **Linux 新機初始化（Bootstrap）** | 依 `policies/bootstrap_steps.toml` 逐步執行：SSH 公鑰、免密 sudo、Hostname、強密碼輪替、Zabbix、CrowdStrike、LVM 系統碟擴容與 `/data` 掛載、清理暫存檔與金鑰登入驗證 |
+| **新機初始化（Bootstrap）** | 支援 Linux（`policies/bootstrap_steps_linux.toml`）與 Windows OpenSSH（`policies/bootstrap_steps_windows.toml`）：SSH 公鑰、Hostname、強密碼輪替、Zabbix、CrowdStrike、系統碟擴容與額外硬碟掛載；Linux 含免密 sudo 與清理，Windows 含 DNS、排程清理、SCCM、系統檢查與完成後重開機 |
 | **VM 生命週期背景追蹤（`/jobs`）** | VM 申請送出後自動啟動 `VMLifecycleGraph`：背景等待 Aria 審核與建機 ➔ 抵達「② 硬碟調整」審核 ➔ 背景執行硬碟調整 ➔ 抵達「③ 初始設定」審核與斷點續跑 |
 
 ---
@@ -68,11 +68,11 @@ vm_agent/
 │   │   └── runner.py             #   前景同步與背景非同步子圖執行器、通用輪詢骨架
 │   ├── vm_provisioning/          #   VM 開立申請子圖 (state/reasoning/resolver/nodes/graph/tool)
 │   ├── vm_disk/                  #   Day-2 硬碟調整子圖 (state/executor/nodes/graph/tool)
-│   ├── vm_bootstrap/             #   Linux 新機初始化子圖 (state/steps/nodes/graph/tool)
+│   ├── vm_bootstrap/             #   Linux / Windows 新機初始化子圖 (state/steps/nodes/graph/tool)
 │   └── vm_lifecycle/             #   VM 全生命週期子圖 (state/nodes/graph/service)
 ├── clients/                      # 無狀態底層連線 SDK
 │   ├── aria/                     #   Aria REST API (session/catalog/forms/iaas/deployment/vro/inspect)
-│   ├── ssh_client.py             #   Paramiko SSH/SFTP (PAM 首次改密碼、0600 機密檔注入)
+│   ├── ssh_client.py             #   Paramiko SSH/SFTP (Linux/Windows OpenSSH、PAM 改密碼、機密暫存檔注入)
 │   ├── ollama_client.py          #   本地 Ollama REST API Client
 │   └── llm.py                    #   Gemini Chat Model 工廠
 ├── core/                         # 基礎設施層
@@ -83,9 +83,11 @@ vm_agent/
 │   └── logging_setup.py          #   輪替日誌設定 (logs/app.log)
 ├── policies/                     # 業務規則設定 (TOML)
 │   ├── vm_defaults.example.toml  #   VM 預設值、命名與網段規則範本 (複製為 vm_defaults.toml 使用)
-│   └── bootstrap_steps.toml      #   新機初始化步驟宣告
+│   ├── bootstrap_steps_linux.toml   # Linux 新機初始化步驟宣告
+│   └── bootstrap_steps_windows.toml # Windows 新機初始化步驟宣告
 ├── scripts/                      # 遠端執行腳本與輔助工具
-│   ├── bootstrap/                #   新機初始化 Shell 腳本
+│   ├── bootstrap/                #   新機初始化腳本 (linux/*.sh 與 windows/*.ps1)
+│   ├── installers/               #   大型安裝檔目錄 (不進版控：CrowdStrike/{Ubuntu,RHEL_8,RHEL_9,Windows}、SCCM/)
 │   ├── diag/                     #   Linux 唯讀診斷 Shell 腳本
 │   └── passwd_creator.py         #   強密碼產生器
 └── tests/                        # Pytest 單元與整合測試套件
@@ -140,7 +142,7 @@ pip install -r requirements-dev.txt
    ```
 2. 複製 `policies/vm_defaults.example.toml` 為 `policies/vm_defaults.toml`（不進版控），填入貴單位的專案網段對應與預設值。
 3. （選用）若需自訂內部 Prompt 或範例問句，建立 `prompts.local.toml`（不進版控），以相同 `[section].key` 覆蓋 `prompts.toml`。
-4. （選用）若需自動安裝 CrowdStrike，將安裝檔放入 `scripts/bootstrap/CrowdStrike/`（`Ubuntu/`、`RHEL_8/`、`RHEL_9/`）。
+4. （選用）若需自動安裝 CrowdStrike / SCCM，將安裝檔放入 `scripts/installers/CrowdStrike/`（`Ubuntu/`、`RHEL_8/`、`RHEL_9/`、`Windows/`）與 `scripts/installers/SCCM/`。
 
 ### 4. 啟動程式
 
@@ -192,7 +194,7 @@ python -m pytest -v
 - `tests/test_bootstrap_flow.py`：新機初始化審核、密碼重產與重啟遺失恢復、機密零外洩驗證、斷點續跑
 - `tests/test_jobs.py`：VM 生命週期背景輪詢、不重跑掃描、Add Disk 冪等與崩潰防重送、Bootstrap 中斷續跑、前景 `adjust_vm_disk`、Per-Task 喚醒與資源釋放
 - `tests/test_cli.py`：通用審核畫面渲染、對話回合與中斷自動詢問續跑
-- `tests/test_policy.py`：Policy fallback 載入、網段與命名規則、`bootstrap_steps.toml` 機密隔離檢查
+- `tests/test_policy.py`：Policy fallback 載入、網段與命名規則、`bootstrap_steps_{linux,windows}.toml` 機密隔離檢查
 - `tests/test_ticket_form.py`：申請單正規表示式預處理、`parsers.ticket_parser.parse_ticket` 補值、路徑遍歷防呆與快取驗證
 - `tests/test_security_helpers.py`：審核輸入解析、SSH `secret_env` 與 PAM 登入降級、診斷 `sudo` 降級、機密遮罩與敏感檔案攔截
 - `tests/test_persistence.py`：`AppStore` Session / Pipeline 存取篩選與 `delete_thread_checkpoints` 清理驗證

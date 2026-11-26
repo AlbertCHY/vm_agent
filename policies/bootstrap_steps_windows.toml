@@ -1,0 +1,101 @@
+# ════════════════════════════════════════════════════════════════
+# 新 Windows VM 基本設定 (Bootstrap) 步驟定義 — 依序執行
+#
+# 樣板變數 (用於 env，非機密)：
+#   {ip} {hostname} {user1} {user2} {pub_key}
+#   {windows_dns_servers} {zabbix_servers} {zabbix_conf}
+#   {sccm_site_code} {sccm_fsp} {sccm_smsmp} {sccm_remote_dir}
+#   {cs_mode} {cs_proxy_host} {cs_proxy_port} {crowdstrike_remote_dir}
+#   {extra_disk_start_letter} {cs_skip_str}
+# 機密樣板變數 (只能用於 secret_env，以 SFTP 暫存 JSON 載入後立即刪除，不出現在命令列)：
+#   {admin_password} {user2_password} {mdr_cid} {mdr_token} {ngav_cid} {ngav_token}
+#
+# 注意：
+#   - 腳本與安裝檔上傳至登入帳號桌面的 bootstrap 資料夾 (C:/Users/{init_user}/Desktop/bootstrap)，
+#     機密暫存 JSON 檔分開存放在 Temp 目錄且載入後立即刪除，不出現在桌面與命令列。
+#   - Windows 不設定 [cleanup]（保留桌面資料夾供後續稽核或重試免重傳大型安裝檔）。
+#   - [finalize].reboot_on_success = true：全部步驟與 SSH 金鑰驗證通過後自動排程重開機。
+# ════════════════════════════════════════════════════════════════
+
+[upload]
+remote_dir = "C:/Users/{init_user}/Desktop/bootstrap"
+crowdstrike_remote_dir = "C:/Users/{init_user}/Desktop/bootstrap/CrowdStrike"
+sccm_remote_dir = "C:/Users/{init_user}/Desktop/bootstrap/SCCM"
+secret_temp_dir = "C:/Users/{init_user}/AppData/Local/Temp"
+
+[[steps]]
+id = "add_pub_key"
+name = "部署管理帳號 SSH 公鑰 (add_pub_key.ps1)"
+script = "add_pub_key.ps1"
+env = { TARGET_USER = "{user1}", SSH_PUB_KEY = "{pub_key}" }
+
+[[steps]]
+id = "set_dns"
+name = "設定網卡靜態 DNS (set_dns.ps1)"
+script = "set_dns.ps1"
+env = { TARGET_IP = "{ip}", WINDOWS_DNS_SERVERS = "{windows_dns_servers}" }
+
+[[steps]]
+id = "set_hostname"
+name = "變更電腦名稱 Hostname (set_hostname.ps1)"
+script = "set_hostname.ps1"
+env = { NEW_HOSTNAME = "{hostname}" }
+
+[[steps]]
+id = "set_passwords"
+name = "修改固定帳號密碼 (set_passwords.ps1)"
+script = "set_passwords.ps1"
+stop_on_fail = true
+rotates_password = true
+env = { USER1 = "{user1}", USER2 = "{user2}" }
+secret_env = { PW_USER1 = "{admin_password}", PW_USER2 = "{user2_password}" }
+
+[[steps]]
+id = "delete_task"
+name = "移除預設排程工作 (delete_task.ps1)"
+script = "delete_task.ps1"
+env = { TARGET_TASK = 'Microsoft\HHCloud_Zabbix' }
+
+[[steps]]
+id = "set_zabbix"
+name = "更新 Zabbix Agent 設定與重啟服務 (set_zabbix.ps1)"
+script = "set_zabbix.ps1"
+env = { TARGET_IP = "{ip}", ZABBIX_SERVERS = "{zabbix_servers}", ZABBIX_CONF = "{zabbix_conf}" }
+
+[[steps]]
+id = "set_sccm"
+name = "安裝 SCCM Client 並等待服務啟動 (set_sccm.ps1)"
+script = "set_sccm.ps1"
+timeout = 900
+env = { SCCM_SITE_CODE = "{sccm_site_code}", SCCM_FSP = "{sccm_fsp}", SCCM_SMSMP = "{sccm_smsmp}", SCCM_DIR = "{sccm_remote_dir}" }
+
+[[steps]]
+id = "set_crowdstrike"
+name = "安裝與設定 CrowdStrike ({cs_mode}) (set_crowdstrike.ps1)"
+script = "set_crowdstrike.ps1"
+skip_if = "cs_skip"
+timeout = 300
+env = { CS_INSTALL_TYPE = "{cs_mode}", CS_PROXY_HOST = "{cs_proxy_host}", CS_PROXY_PORT = "{cs_proxy_port}", CS_DIR = "{crowdstrike_remote_dir}" }
+secret_env = { MDR_CID = "{mdr_cid}", MDR_TOKEN = "{mdr_token}", NGAV_CID = "{ngav_cid}", NGAV_TOKEN = "{ngav_token}" }
+
+[[steps]]
+id = "expand_root_disk"
+name = "重新掃描磁碟並擴充 C 槽容量 (expand_root_disk.ps1)"
+script = "expand_root_disk.ps1"
+skip_if = "disk_skip"
+
+[[steps]]
+id = "mount_extra_disk"
+name = "初始化額外硬碟 (GPT / NTFS) 並掛載 (mount_extra_disk.ps1)"
+script = "mount_extra_disk.ps1"
+skip_if = "disk_skip"
+env = { START_DRIVE_LETTER = "{extra_disk_start_letter}" }
+
+[[steps]]
+id = "check_system"
+name = "檢查服務狀態、磁碟配置與網路設定 (check_system.ps1)"
+script = "check_system.ps1"
+env = { CS_SKIP = "{cs_skip_str}", NEW_HOSTNAME = "{hostname}" }
+
+[finalize]
+reboot_on_success = true

@@ -86,11 +86,23 @@ NGAV_CID: str = os.getenv("NGAV_CID", "")
 NGAV_TOKEN: str = os.getenv("NGAV_TOKEN", "")
 CROWDSTRIKE_DEFAULT_MODE: str = os.getenv("CROWDSTRIKE_DEFAULT_MODE", "NGAV").upper()
 ZABBIX_SERVERS: str = os.getenv("ZABBIX_SERVERS", "")
-ZABBIX_CONF_PATH: str = os.getenv("ZABBIX_CONF_PATH", "/etc/zabbix/zabbix_agentd.conf")
+LINUX_ZABBIX_CONF_PATH: str = os.getenv("LINUX_ZABBIX_CONF_PATH", "/etc/zabbix/zabbix_agentd.conf")
+WINDOWS_ZABBIX_CONF_PATH: str = os.getenv(
+    "WINDOWS_ZABBIX_CONF_PATH", r"C:\Program Files\Zabbix Agent\zabbix_agentd.conf"
+)
+WINDOWS_DNS_SERVERS: str = os.getenv("WINDOWS_DNS_SERVERS", "")
+WINDOWS_SCCM_SITE_CODE: str = os.getenv("WINDOWS_SCCM_SITE_CODE", "")
+WINDOWS_SCCM_FSP: str = os.getenv("WINDOWS_SCCM_FSP", "")
+WINDOWS_SCCM_SMSMP: str = os.getenv("WINDOWS_SCCM_SMSMP", "")
+WINDOWS_EXTRA_DISK_START_LETTER: str = os.getenv("WINDOWS_EXTRA_DISK_START_LETTER", "E").strip().upper() or "E"
 SCRIPTS_DIR: Path = BASE_DIR / "scripts"
 BOOTSTRAP_SCRIPTS_DIR: Path = SCRIPTS_DIR / "bootstrap"
+BOOTSTRAP_LINUX_SCRIPTS_DIR: Path = BOOTSTRAP_SCRIPTS_DIR / "linux"
+BOOTSTRAP_WINDOWS_SCRIPTS_DIR: Path = BOOTSTRAP_SCRIPTS_DIR / "windows"
 DIAG_SCRIPTS_DIR: Path = SCRIPTS_DIR / "diag"
-CROWDSTRIKE_LOCAL_DIR: Path = _env_path("CROWDSTRIKE_LOCAL_DIR", BOOTSTRAP_SCRIPTS_DIR / "CrowdStrike")
+INSTALLERS_DIR: Path = _env_path("INSTALLERS_DIR", SCRIPTS_DIR / "installers")
+CROWDSTRIKE_INSTALLERS_DIR: Path = INSTALLERS_DIR / "CrowdStrike"
+SCCM_INSTALLERS_DIR: Path = INSTALLERS_DIR / "SCCM"
 
 # ─── 工單資料夾 ───
 TICKETS_DIR: Path = _env_path("TICKETS_DIR", BASE_DIR / "tickets")

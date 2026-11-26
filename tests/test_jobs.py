@@ -248,7 +248,7 @@ def test_bootstrap_interrupted_at_step3_resumes_from_jobs_without_reset(lc_graph
         return orig_exec(ip, cmd, **kw)
 
     ssh.exec_command = interrupt_at_step3
-    answers = deque(["e", "cs_mode=SKIP, skip_disk=true"])
+    answers = deque(["e", "cs_mode=SKIP, skip_disk=true", "a"])
     monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
 
     # 第一次執行 run_bootstrap：審核通過，跑完第 1、2 步，在第 3 步中斷
@@ -285,7 +285,9 @@ def test_lifecycle_without_disk_goes_to_bootstrap_or_done(lc_graph, monkeypatch)
     win = _new_job(lc_graph, is_linux=False)
     lc_graph.invoke(None, config=lifecycle_config(win.id))
     win_job = get_lifecycle_job(win.id, graph=lc_graph)
-    assert win_job.stage == DONE and "Windows" in win_job.note
+    assert win_job.stage == BOOTSTRAP_REVIEW
+    win_state = lc_graph.get_state(lifecycle_config(win.id)).values
+    assert win_state.get("os_type") == "windows"
 
 
 def test_lifecycle_failure_and_overdue_persisted_in_checkpoint(lc_graph, monkeypatch):
@@ -335,12 +337,34 @@ def test_adjust_vm_disk_tool_review_and_execute(monkeypatch):
     monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
     monkeypatch.setattr(disk_nodes.time, "sleep", lambda s: None)
     agent, _ = build_agent_calling(disk_tool.adjust_vm_disk, {"ip": "10.0.0.60", "extra_disk_gb": 50})
-    answers = iter([{"action": "edit", "edits": {"extra_disk_gb": "abc"}},
-                    {"action": "edit", "edits": {"boot_disk_gb": "80G", "extra_disk_gb": "100"}}])
+    answers = iter([
+        {"action": "edit", "edits": {"extra_disk_gb": "abc"}},
+        {"action": "edit", "edits": {"boot_disk_gb": "80G", "extra_disk_gb": "100"}},
+        {"action": "approve"},
+    ])
     requests, tool_msg = drive(agent, lambda req: next(answers))
-    assert len(requests) == 2 and any("整數" in e for e in requests[1]["errors"])
+    assert len(requests) == 3 and any("整數" in e for e in requests[1]["errors"])
     assert tool_msg.artifact["status"] == "completed"
     assert [(a, i["capacityGb"]) for _, a, i in aria.deployments.submitted] == [(RESIZE_BOOT_DISK, 80), (ADD_DISK, 100)]
+
+
+def test_adjust_vm_disk_clear_boot_disk_and_re_review(monkeypatch):
+    """驗證輸入 boot_disk_gb=0, extra_disk_gb=200 後會先回到審核畫面確認，再核准只執行 Add Disk"""
+    aria = FakeAria()
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(disk_nodes.time, "sleep", lambda s: None)
+    agent, _ = build_agent_calling(disk_tool.adjust_vm_disk, {"ip": "10.0.0.60", "boot_disk_gb": 200})
+    answers = iter([
+        {"action": "edit", "edits": {"boot_disk_gb": "0", "extra_disk_gb": "200"}},
+        {"action": "approve"},
+    ])
+    requests, tool_msg = drive(agent, lambda req: next(answers))
+    assert len(requests) == 2
+    fields_after = {f["key"]: f["value"] for f in requests[1]["fields"]}
+    assert fields_after["boot_disk_gb"] == "(不調整)"
+    assert fields_after["extra_disk_gb"] == 200
+    assert tool_msg.artifact["status"] == "completed"
+    assert [(a, i["capacityGb"]) for _, a, i in aria.deployments.submitted] == [(ADD_DISK, 200)]
 
 
 def test_adjust_vm_disk_tool_skips_existing_extra_disk_idempotently(monkeypatch):
@@ -431,7 +455,7 @@ def test_prepare_bootstrap_retry_resumes_from_failed_step(lc_graph, fakes, monke
         return orig_exec(ip, cmd, **kw)
 
     ssh.exec_command = fail_at_hostname
-    answers = deque(["e", "cs_mode=SKIP, skip_disk=true"])
+    answers = deque(["e", "cs_mode=SKIP, skip_disk=true", "a"])
     monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
 
     jobs_cli.run_bootstrap(job.id, graph=lc_graph)

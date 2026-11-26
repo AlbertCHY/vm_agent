@@ -54,9 +54,13 @@ class ReviewDecision(BaseModel):
 # ─── 常用動作 ───
 APPROVE = ReviewActionSpec(action="approve", hotkey="A", label="確認無誤，核准並執行 (Approve)")
 EDIT = ReviewActionSpec(action="edit", hotkey="E", label="修改指定參數後執行 (Edit & Approve)", needs_edits=True)
+EDIT_REVIEW = ReviewActionSpec(action="edit", hotkey="E", label="修改指定參數並重新檢視 (Edit)", needs_edits=True)
 REJECT = ReviewActionSpec(action="reject", hotkey="R", label="給予修改指示並退回重新推論 (Reject)", needs_feedback=True)
 SKIP = ReviewActionSpec(action="skip", hotkey="S", label="略過 / 取消 (Skip)", needs_feedback=True)
 REGENERATE = ReviewActionSpec(action="regenerate", hotkey="P", label="重新產生隨機密碼 (Regenerate)")
+
+# CLI 端修改機密欄位時，以本前綴包裝 SecretStore 暫存參照，避免明文進入 Command(resume) 與 Checkpoint
+SECRET_REF_PREFIX = "secret_ref:"
 
 
 def review_request(

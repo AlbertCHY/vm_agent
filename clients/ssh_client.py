@@ -1,6 +1,8 @@
-"""Paramiko SSH / SFTP 封裝 (支援私鑰與初始密碼登入、首次登入 PAM 強制改密碼處理、SFTP 檔案/資料夾上傳、sudo -S 提權執行)"""
+"""Paramiko SSH / SFTP 封裝 (支援 Linux 與 Windows OpenSSH、私鑰與初始密碼登入、PAM 強制改密碼、SFTP 檔案/資料夾上傳、機密暫存檔注入)"""
+import base64
 import io
 import ipaddress
+import json
 import posixpath
 import re
 import shlex
@@ -250,9 +252,10 @@ class SSHClient:
         username: str,
         init_password: Optional[str],
         new_password: str,
+        os_type: str = "linux",
     ) -> tuple[int, Optional[str], bool, str]:
         """
-        確保目標新 VM 可正常執行指令與 SFTP，若遇首次登入強制改密碼則自動改為 new_password。
+        確保目標新 VM 可正常執行指令與 SFTP，若遇首次登入強制改密碼 (Linux PAM) 則自動改為 new_password。
 
         Returns:
             (exit_code, active_password, password_changed_by_pam, status_message)
@@ -260,43 +263,75 @@ class SSHClient:
             - active_password 為後續 SFTP / sudo 應使用的密碼 (若為 None 代表使用 SSH 私鑰連線)
             - password_changed_by_pam 為 True 代表剛剛已自動完成 PAM 首次強制改密碼
         """
+        is_windows = (os_type or "linux").strip().lower() == "windows"
+        exec_kw = {"os_type": "windows"} if is_windows else {}
+
         # 1. 若有提供初始密碼，先測試直接執行 whoami
         if init_password:
-            ec, out, err = self.exec_command(ip, "whoami", username=username, password=init_password, cmd_timeout=8)
+            ec, out, err = self.exec_command(
+                ip, "whoami", username=username, password=init_password, cmd_timeout=8, **exec_kw
+            )
             combined = f"{out}\n{err}".lower()
             if ec == 0 and username.lower() in out.lower() and "expired" not in combined and "change your password" not in combined:
                 return 0, init_password, False, "使用初始預設密碼連線正常"
 
-            # 2. 若因密碼過期導致 exec_command 失敗或出現 expired 提示，啟動 PAM 互動改密碼
-            changed, msg = self._handle_pam_expired_password(ip, username, init_password, new_password)
-            if changed:
-                # 驗證新密碼是否已可正常執行 whoami
-                ec_new, out_new, err_new = self.exec_command(
-                    ip, "whoami", username=username, password=new_password, cmd_timeout=8
-                )
-                if ec_new == 0 and username.lower() in out_new.lower():
-                    return 0, new_password, True, msg
-                return (
-                    self.ERR_AUTH,
-                    None,
-                    True,
-                    f"已執行 PAM 改密碼 ({msg})，但以新密碼驗證失敗：{err_new or out_new}",
-                )
+            # 2. Linux 若因密碼過期導致 exec_command 失敗或出現 expired 提示，啟動 PAM 互動改密碼
+            if not is_windows:
+                changed, msg = self._handle_pam_expired_password(ip, username, init_password, new_password)
+                if changed:
+                    ec_new, out_new, err_new = self.exec_command(
+                        ip, "whoami", username=username, password=new_password, cmd_timeout=8
+                    )
+                    if ec_new == 0 and username.lower() in out_new.lower():
+                        return 0, new_password, True, msg
+                    return (
+                        self.ERR_AUTH,
+                        None,
+                        True,
+                        f"已執行 PAM 改密碼 ({msg})，但以新密碼驗證失敗：{err_new or out_new}",
+                    )
 
         # 3. 嘗試是否已經是 new_password 或已配置 SSH 私鑰
         if new_password:
-            ec2, out2, _ = self.exec_command(ip, "whoami", username=username, password=new_password, cmd_timeout=6)
+            ec2, out2, _ = self.exec_command(
+                ip, "whoami", username=username, password=new_password, cmd_timeout=6, **exec_kw
+            )
             if ec2 == 0 and username.lower() in out2.lower():
                 return 0, new_password, False, "已使用新密碼連線成功"
 
         if self.key_path.exists():
-            ec3, out3, err3 = self.exec_command(ip, "whoami", username=username, password=None, cmd_timeout=6)
+            ec3, out3, err3 = self.exec_command(
+                ip, "whoami", username=username, password=None, cmd_timeout=6, **exec_kw
+            )
             if ec3 == 0 and username.lower() in out3.lower():
                 return 0, None, False, "已使用 SSH 私鑰免密連線成功"
             if not init_password:
                 return ec3, None, False, err3
 
         return self.ERR_AUTH, None, False, f"無法以初始密碼或私鑰登入 {username}@{ip} (請確認 BOOTSTRAP_INIT_PASSWORD 是否正確)"
+
+    @staticmethod
+    def _to_sftp_path(path: str, os_type: str = "linux") -> str:
+        """將遠端路徑正規化為 SFTP 協定格式 (Windows OpenSSH SFTP 絕對路徑為 /C:/...)"""
+        if (os_type or "linux").strip().lower() != "windows":
+            return path
+        norm = path.replace("\\", "/").rstrip("/")
+        if re.match(r"^[A-Za-z]:(/|$)", norm):
+            norm = "/" + norm
+        return norm
+
+    @staticmethod
+    def _to_win_path(path: str) -> str:
+        """將 SFTP 或正斜線 Windows 路徑轉回原生反斜線路徑 (/C:/Temp/a.ps1 -> C:\\Temp\\a.ps1)"""
+        norm = path.replace("\\", "/")
+        if re.match(r"^/[A-Za-z]:(/|$)", norm):
+            norm = norm[1:]
+        return norm.replace("/", "\\")
+
+    @staticmethod
+    def _ps_quote(value: str) -> str:
+        """PowerShell 單引號字串跳脫"""
+        return "'" + str(value).replace("'", "''") + "'"
 
     @staticmethod
     def build_env_file(secret_env: dict[str, str]) -> str:
@@ -311,6 +346,81 @@ class SSHClient:
         return "\n".join(lines) + "\n"
 
     @staticmethod
+    def build_windows_secret_file(secret_env: dict[str, str]) -> str:
+        """產生給 Windows PowerShell 載入的 UTF-8 JSON 機密環境變數內容"""
+        clean: dict[str, str] = {}
+        for k, v in secret_env.items():
+            if v is None:
+                continue
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+                raise ValueError(f"不合法的環境變數名稱: {k}")
+            clean[k] = str(v)
+        return json.dumps(clean, ensure_ascii=False)
+
+    @classmethod
+    def build_windows_command(
+        cls,
+        cmd: str,
+        env: Optional[dict[str, str]] = None,
+        env_file: Optional[str] = None,
+    ) -> str:
+        """
+        組合送往 Windows OpenSSH (預設 Shell 為 cmd.exe) 的遠端指令。
+        - 純粹的 cmd 指令 (無 env / env_file 且非 .ps1 腳本) 直接送出 (如 whoami / shutdown)。
+        - .ps1 腳本或含環境變數時，透過 PowerShell `-EncodedCommand` 避開 cmd.exe 跳脫地雷；
+          機密變數絕不放入命令列或 EncodedCommand，而是從 SFTP 暫存 JSON 檔載入後立即刪除。
+        """
+        stripped = cmd.strip()
+        is_ps1 = stripped.lower().endswith(".ps1")
+        if not env and not env_file and not is_ps1:
+            return cmd
+
+        ps_lines = [
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+            "$OutputEncoding = [System.Text.Encoding]::UTF8",
+        ]
+        for k, v in (env or {}).items():
+            if v is None:
+                continue
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+                raise ValueError(f"不合法的環境變數名稱: {k}")
+            ps_lines.append(f"$env:{k} = {cls._ps_quote(str(v))}")
+
+        if env_file:
+            win_sf = cls._to_win_path(env_file)
+            ps_lines.extend([
+                f"$__sf = {cls._ps_quote(win_sf)}",
+                "if (Test-Path -LiteralPath $__sf) {",
+                "  try {",
+                "    $__d = Get-Content -LiteralPath $__sf -Raw -Encoding UTF8 | ConvertFrom-Json",
+                "    foreach ($__p in $__d.PSObject.Properties) {",
+                "      Set-Item -Path ('Env:' + $__p.Name) -Value ([string]$__p.Value)",
+                "    }",
+                "  } finally {",
+                "    Remove-Item -LiteralPath $__sf -Force -ErrorAction SilentlyContinue",
+                "  }",
+                "}",
+            ])
+
+        invoke_line = f"& {cls._ps_quote(cls._to_win_path(stripped))}" if is_ps1 else stripped
+        ps_lines.extend([
+            "try {",
+            "  $global:LASTEXITCODE = 0",
+            f"  {invoke_line}",
+            "  if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "  if (-not $?) { exit 1 }",
+            "  exit 0",
+            "} catch {",
+            "  [Console]::Error.WriteLine($_.Exception.Message)",
+            "  exit 1",
+            "}",
+        ])
+
+        script = "\n".join(ps_lines)
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        return f"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+
+    @staticmethod
     def build_command(
         cmd: str,
         env: Optional[dict[str, str]] = None,
@@ -319,7 +429,7 @@ class SSHClient:
         env_file: Optional[str] = None,
     ) -> str:
         """
-        組合實際送出的遠端指令。
+        組合實際送出的遠端指令 (Linux POSIX / bash)。
         - env：非機密環境變數，直接放在命令列 (遠端 ps 可見)。
         - env_file：機密環境變數檔路徑；載入後立即刪除，再執行 cmd，機密值不會出現在命令列。
         """
@@ -352,17 +462,20 @@ class SSHClient:
         env: Optional[dict[str, str]] = None,
         cmd_timeout: Optional[int] = None,
         secret_env: Optional[dict[str, str]] = None,
+        os_type: str = "linux",
+        remote_temp_dir: Optional[str] = None,
     ) -> tuple[int, str, str]:
         """
-        連入 ip 並執行 cmd (支援私鑰或密碼登入，以及 sudo -S 提權與環境變數注入)。
+        連入 ip 並執行 cmd (支援 Linux 與 Windows OpenSSH、私鑰或密碼登入、sudo -S 提權與機密環境變數注入)。
 
-        secret_env：機密環境變數 (密碼、Token)。會先以 SFTP 寫入權限 600 的暫存檔，
-                    遠端 shell 載入後立即刪除，避免出現在 `ps`、sudo log 或 auditd 的命令列紀錄中。
+        secret_env：機密環境變數 (密碼、Token)。會先以 SFTP 寫入暫存檔 (Linux 權限 600 / Windows 暫存 JSON)，
+                    遠端 shell 載入後立即刪除，避免出現在 `ps`、sudo log 或命令列紀錄中。
 
         Returns:
             (exit_code, stdout, stderr)
             exit_code >= 0 為遠端指令回傳值；< 0 為本地端連線錯誤 (見 ERR_* 常數)，錯誤說明放在 stderr。
         """
+        is_windows = (os_type or "linux").strip().lower() == "windows"
         exec_timeout = cmd_timeout or self.timeout
         client, err_code, err_msg = self._connect(ip, username=username, password=password)
         if client is None:
@@ -371,22 +484,33 @@ class SSHClient:
         env_file: Optional[str] = None
         try:
             if secret_env:
-                env_file = f"/tmp/.aria_env_{uuid.uuid4().hex}"
                 sftp = client.open_sftp()
                 try:
-                    # 先建立空檔並設為 600，再寫入內容，避免短暫出現可被他人讀取的視窗
-                    with sftp.open(env_file, "w") as fh:
-                        sftp.chmod(env_file, 0o600)
-                        fh.write(self.build_env_file(secret_env))
+                    if is_windows:
+                        base_tmp = self._to_sftp_path(remote_temp_dir or "C:/Temp/vm_bootstrap", os_type="windows")
+                        self._sftp_mkdir_p(sftp, base_tmp)
+                        env_file = posixpath.join(base_tmp, f".aria_env_{uuid.uuid4().hex}.json")
+                        payload = self.build_windows_secret_file(secret_env).encode("utf-8")
+                        with sftp.open(env_file, "wb") as fh:
+                            fh.write(payload)
+                    else:
+                        env_file = f"/tmp/.aria_env_{uuid.uuid4().hex}"
+                        # 先建立空檔並設為 600，再寫入內容，避免短暫出現可被他人讀取的視窗
+                        with sftp.open(env_file, "w") as fh:
+                            sftp.chmod(env_file, 0o600)
+                            fh.write(self.build_env_file(secret_env))
                 finally:
                     sftp.close()
 
-            full_cmd = self.build_command(
-                cmd, env=env, sudo=sudo, sudo_password=bool(sudo and sudo_password), env_file=env_file
-            )
+            if is_windows:
+                full_cmd = self.build_windows_command(cmd, env=env, env_file=env_file)
+            else:
+                full_cmd = self.build_command(
+                    cmd, env=env, sudo=sudo, sudo_password=bool(sudo and sudo_password), env_file=env_file
+                )
 
             stdin, stdout, stderr = client.exec_command(full_cmd, timeout=exec_timeout)
-            if sudo and sudo_password:
+            if not is_windows and sudo and sudo_password:
                 stdin.write(sudo_password + "\n")
                 stdin.flush()
             stdin.channel.shutdown_write()
@@ -402,7 +526,7 @@ class SSHClient:
             return self.ERR_SSH, "", f"SSH 指令執行錯誤 ({ip})：{type(e).__name__}: {e}"
         finally:
             if env_file:
-                # 正常情況下遠端 shell 已刪除；若指令未執行到 (例如 sudo 失敗)，在此補刪
+                # 正常情況下遠端 shell 已刪除；若指令未執行到 (例如啟動失敗)，在此補刪
                 try:
                     sftp = client.open_sftp()
                     try:
@@ -417,12 +541,15 @@ class SSHClient:
 
     @staticmethod
     def _sftp_mkdir_p(sftp: "paramiko.SFTPClient", remote_dir: str) -> None:
-        """遞迴建立遠端目錄 (相當於 mkdir -p)"""
+        """遞迴建立遠端目錄 (相容 Linux 路徑與 Windows /C:/... 路徑)"""
         dirs: list[str] = []
-        cur = remote_dir
-        while cur not in ("", "/"):
+        cur = remote_dir.replace("\\", "/").rstrip("/")
+        while cur not in ("", "/") and not re.match(r"^/?[A-Za-z]:$", cur):
             dirs.append(cur)
-            cur = posixpath.dirname(cur)
+            parent = posixpath.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
         for d in reversed(dirs):
             try:
                 sftp.stat(d)
@@ -431,13 +558,31 @@ class SSHClient:
 
     @staticmethod
     def _put_file_normalized(sftp: "paramiko.SFTPClient", local_file: Path, remote_path: str) -> None:
-        """上傳單一檔案；若為 .sh 腳本則自動將 Windows CRLF 正規化為 LF 並設為 0755"""
-        if local_file.suffix.lower() == ".sh":
+        """上傳單一檔案：.sh 轉 LF + 0755；.ps1 轉 UTF-8 BOM + CRLF (相容 PowerShell 5.1)"""
+        suffix = local_file.suffix.lower()
+        if suffix == ".sh":
             raw = local_file.read_bytes().replace(b"\r\n", b"\n")
             sftp.putfo(io.BytesIO(raw), remote_path)
             sftp.chmod(remote_path, 0o755)
+        elif suffix == ".ps1":
+            text = local_file.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\n", "\r\n")
+            sftp.putfo(io.BytesIO(text.encode("utf-8-sig")), remote_path)
         else:
             sftp.put(str(local_file), remote_path)
+
+    def wait_port_ready(self, ip: str, initial_delay: float = 3.0, timeout: float = 20.0) -> bool:
+        """等待遠端 SSH 服務完成重啟並重新接受 TCP 連線"""
+        host = ip.strip()
+        if initial_delay > 0:
+            time.sleep(initial_delay)
+        deadline = time.time() + max(timeout, 1.0)
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, self.port), timeout=2.0):
+                    return True
+            except OSError:
+                time.sleep(1.0)
+        return False
 
     def upload_files(
         self,
@@ -445,12 +590,17 @@ class SSHClient:
         files: list[Path],
         remote_dir: str = "/tmp",
         extra_dirs: Optional[list[tuple[Path, str]]] = None,
+        extra_files: Optional[list[tuple[Path, str]]] = None,
+        exclude_dir_names: Optional[set[str]] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
         transfer_timeout: int = 120,
+        os_type: str = "linux",
     ) -> tuple[int, list[str], str]:
         """
-        透過 SFTP 批次上傳腳本檔案與附加資料夾 (如 CrowdStrike 安裝檔目錄)。
+        透過 SFTP 批次上傳腳本檔案、指定檔案清單 (extra_files) 與附加資料夾 (extra_dirs)。
+        - exclude_dir_names：於遞迴 extra_dirs 時略過的資料夾名稱 (不分大小寫，例如 {"i386"})。
+        - 附加安裝檔若遠端已存在且大小一致會略過重傳 (利於中斷續跑)。
 
         Returns:
             (0, uploaded_remote_paths, "") 成功；或 (ERR_*, uploaded_so_far, err_msg) 失敗。
@@ -461,28 +611,58 @@ class SSHClient:
         if client is None:
             return err_code, [], err_msg
 
+        sftp_remote_dir = self._to_sftp_path(remote_dir, os_type=os_type)
+        excluded = {d.lower() for d in (exclude_dir_names or set())}
         uploaded: list[str] = []
         try:
             sftp = client.open_sftp()
             try:
-                self._sftp_mkdir_p(sftp, remote_dir)
+                self._sftp_mkdir_p(sftp, sftp_remote_dir)
                 for f in files:
                     if not f.is_file():
                         return self.ERR_CONFIG, uploaded, f"找不到本機腳本檔案: {f}"
-                    rpath = posixpath.join(remote_dir, f.name)
+                    rpath = posixpath.join(sftp_remote_dir, f.name)
                     self._put_file_normalized(sftp, f, rpath)
                     uploaded.append(rpath)
+
+                for local_file, target_remote_dir in extra_files or []:
+                    if not local_file.is_file():
+                        continue
+                    sftp_target_dir = self._to_sftp_path(target_remote_dir, os_type=os_type)
+                    self._sftp_mkdir_p(sftp, sftp_target_dir)
+                    rtarget = posixpath.join(sftp_target_dir, local_file.name)
+                    if local_file.suffix.lower() not in (".sh", ".ps1"):
+                        try:
+                            if sftp.stat(rtarget).st_size == local_file.stat().st_size:
+                                uploaded.append(rtarget)
+                                continue
+                        except OSError:
+                            pass
+                    self._put_file_normalized(sftp, local_file, rtarget)
+                    uploaded.append(rtarget)
 
                 for local_folder, target_remote_dir in extra_dirs or []:
                     if not local_folder.is_dir():
                         continue
+                    sftp_target_dir = self._to_sftp_path(target_remote_dir, os_type=os_type)
+                    self._sftp_mkdir_p(sftp, sftp_target_dir)
                     for item in local_folder.rglob("*"):
+                        rel_parts = item.relative_to(local_folder).parts
+                        if excluded and any(part.lower() in excluded for part in rel_parts):
+                            continue
                         rel = item.relative_to(local_folder).as_posix()
-                        rtarget = posixpath.join(target_remote_dir, rel)
+                        rtarget = posixpath.join(sftp_target_dir, rel)
                         if item.is_dir():
                             self._sftp_mkdir_p(sftp, rtarget)
                         elif item.is_file():
                             self._sftp_mkdir_p(sftp, posixpath.dirname(rtarget))
+                            if item.suffix.lower() not in (".sh", ".ps1"):
+                                try:
+                                    if sftp.stat(rtarget).st_size == item.stat().st_size:
+                                        uploaded.append(rtarget)
+                                        continue
+                                except OSError:
+                                    pass
                             self._put_file_normalized(sftp, item, rtarget)
                             uploaded.append(rtarget)
             finally:

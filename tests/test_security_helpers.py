@@ -1,4 +1,10 @@
+import base64
+import json
 import shlex
+import subprocess
+import sys
+
+import pytest
 
 from clients.ssh_client import SSHClient
 from subgraphs.common.review import ReviewDecision, parse_edits
@@ -39,6 +45,47 @@ def test_build_command_variants():
 def test_env_file_quoting():
     content = SSHClient.build_env_file({"PW_ROOT": "a'b c$1", "EMPTY": None})
     assert content == "PW_ROOT='a'\"'\"'b c$1'\n"
+
+
+def test_windows_command_and_secret_isolation():
+    assert SSHClient.build_windows_command("whoami") == "whoami"
+    assert SSHClient._to_sftp_path(r"C:\Temp\vm_bootstrap", os_type="windows") == "/C:/Temp/vm_bootstrap"
+    assert SSHClient._to_win_path("/C:/Temp/vm_bootstrap/set_passwords.ps1") == r"C:\Temp\vm_bootstrap\set_passwords.ps1"
+
+    secret_json = SSHClient.build_windows_secret_file({"PW_USER1": "Secr3t'\"$!", "EMPTY": None})
+    assert json.loads(secret_json) == {"PW_USER1": "Secr3t'\"$!"}
+
+    cmd = SSHClient.build_windows_command(
+        "C:/Temp/vm_bootstrap/set_passwords.ps1",
+        env={"USER1": "user1", "ZABBIX_CONF": r"C:\Program Files\Zabbix Agent\zabbix_agentd.conf"},
+        env_file="/C:/Temp/vm_bootstrap/.aria_env_abc.json",
+    )
+    assert cmd.startswith("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ")
+    b64 = cmd.rsplit(" ", 1)[-1]
+    decoded = base64.b64decode(b64).decode("utf-16-le")
+    assert "Secr3t" not in cmd and "Secr3t" not in decoded
+    # 先讀取暫存 JSON、立刻刪除，再執行目標腳本
+    assert decoded.index("ConvertFrom-Json") < decoded.index("Remove-Item") < decoded.index(r"& 'C:\Temp\vm_bootstrap\set_passwords.ps1'")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows PowerShell")
+def test_windows_command_live_powershell_execution_and_secret_cleanup(tmp_path):
+    """實測經由 cmd.exe 執行 build_windows_command：驗證環境變數注入、機密檔即讀即刪、與非零 exit code 回傳"""
+    script = tmp_path / "sample.ps1"
+    secret_file = tmp_path / ".aria_env_test.json"
+    pw = "S3cr!t'\"$%#1"
+    secret_file.write_text(SSHClient.build_windows_secret_file({"PW_TEST": pw}), encoding="utf-8")
+    script.write_text(
+        f"if (Test-Path -LiteralPath '{secret_file}') {{ Write-Output 'LEAKED'; exit 99 }}\n"
+        'Write-Output ("PUB=" + $env:PUB + "|SEC=" + $env:PW_TEST)\n'
+        "exit 7\n",
+        encoding="utf-8-sig",
+    )
+    cmd = SSHClient.build_windows_command(str(script), env={"PUB": "hello world"}, env_file=str(secret_file))
+    res = subprocess.run(["cmd.exe", "/c", cmd], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 7
+    assert res.stdout.strip() == f"PUB=hello world|SEC={pw}"
+    assert not secret_file.exists()
 
 
 # ─── 診斷輸出遮罩與檔案攔截 ───

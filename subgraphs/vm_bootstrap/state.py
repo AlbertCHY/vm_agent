@@ -9,6 +9,7 @@ from typing_extensions import TypedDict
 class BootstrapState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     ip: str
+    os_type: str                  # "linux" | "windows"
     hostname: Optional[str]
     cs_mode: str                  # "NGAV" | "MDR" | "SKIP"
     skip_disk: bool               # 是否略過磁碟擴容與掛載腳本
@@ -22,6 +23,9 @@ class BootstrapState(TypedDict, total=False):
     validation_errors: list[str]
     # 目前 SSH 登入方式："init" (範本初始密碼) | "admin" (新產生的管理密碼) | "key" (SSH 私鑰)
     login_mode: str
+    # 實際解析後的遠端上傳與機密暫存目錄 (Windows 會於連線後動態解析桌面與 Temp 路徑並寫入 checkpoint)
+    remote_dir: str
+    secret_temp_dir: str
     credentials_saved: bool
     credentials_location: Optional[str]
     # 步驟引擎進度 (每完成一步即寫入 checkpoint，可從中斷處續跑)

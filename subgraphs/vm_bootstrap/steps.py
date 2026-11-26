@@ -1,11 +1,16 @@
-"""Bootstrap 步驟定義載入 (policies/bootstrap_steps.toml) 與樣板展開"""
+"""Bootstrap 步驟定義載入 (policies/bootstrap_steps*.toml) 與樣板展開"""
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 from core.policy import load_policy
 
 DEFAULT_TIMEOUT = 120
+SUPPORTED_OS_TYPES = ("linux", "windows")
+
+
+def normalize_os_type(os_type: Optional[str]) -> str:
+    return "windows" if (os_type or "").strip().lower() == "windows" else "linux"
 
 
 @dataclass(frozen=True)
@@ -41,27 +46,42 @@ class StepDef:
 
 @dataclass(frozen=True)
 class BootstrapPlan:
+    os_type: str
     remote_dir: str
     crowdstrike_remote_dir: str
     steps: tuple[StepDef, ...]
-    cleanup: StepDef
+    cleanup: Optional[StepDef] = None
+    sccm_remote_dir: str = ""
+    secret_temp_dir: str = ""
+    reboot_on_success: bool = False
 
     @property
     def script_files(self) -> list[str]:
         """需上傳的腳本 (去重、維持順序)"""
-        names = [s.script for s in self.steps] + [self.cleanup.script]
+        names = [s.script for s in self.steps]
+        if self.cleanup is not None:
+            names.append(self.cleanup.script)
         return list(dict.fromkeys(names))
 
 
-@lru_cache(maxsize=1)
-def get_bootstrap_plan() -> BootstrapPlan:
-    data = load_policy("bootstrap_steps")
+@lru_cache(maxsize=4)
+def get_bootstrap_plan(os_type: str = "linux") -> BootstrapPlan:
+    os_key = normalize_os_type(os_type)
+    data = load_policy(f"bootstrap_steps_{os_key}")
     upload = data.get("upload") or {}
+    finalize_cfg = data.get("finalize") or {}
+    default_remote = "C:/Users/{init_user}/Desktop/bootstrap" if os_key == "windows" else "/tmp"
+    default_secret_tmp = "C:/Users/{init_user}/AppData/Local/Temp" if os_key == "windows" else "/tmp"
+    cleanup_raw = data.get("cleanup")
     return BootstrapPlan(
-        remote_dir=upload.get("remote_dir", "/tmp"),
-        crowdstrike_remote_dir=upload.get("crowdstrike_remote_dir", "/tmp/CrowdStrike"),
+        os_type=os_key,
+        remote_dir=upload.get("remote_dir", default_remote),
+        crowdstrike_remote_dir=upload.get("crowdstrike_remote_dir", f"{default_remote.rstrip('/')}/CrowdStrike"),
+        sccm_remote_dir=upload.get("sccm_remote_dir", ""),
+        secret_temp_dir=upload.get("secret_temp_dir", default_secret_tmp),
         steps=tuple(StepDef.from_dict(s) for s in data.get("steps") or []),
-        cleanup=StepDef.from_dict(data["cleanup"]),
+        cleanup=StepDef.from_dict(cleanup_raw) if cleanup_raw else None,
+        reboot_on_success=bool(finalize_cfg.get("reboot_on_success", False)),
     )
 
 

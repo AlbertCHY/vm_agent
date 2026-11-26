@@ -14,7 +14,7 @@ import config
 from clients.aria import get_aria_client
 from core.progress import emit
 from core.secrets import get_audit_sink
-from subgraphs.common.review import APPROVE, EDIT, SKIP, ReviewField, ask_review, review_request
+from subgraphs.common.review import APPROVE, EDIT_REVIEW, SKIP, ReviewField, ask_review, review_request
 from subgraphs.common.runner import MAX_CONSECUTIVE_POLL_ERRORS
 from subgraphs.vm_disk.executor import (
     ADD_DISK,
@@ -77,21 +77,35 @@ def _to_size(raw: Any) -> tuple[Optional[int], Optional[str]]:
 def review(state: DiskState) -> dict[str, Any]:
     vm = state.get("vm_name") or ""
     boot, extra = state.get("boot_disk_gb"), state.get("extra_disk_gb")
+    notes = list(state.get("notes") or [])
+    notes.append("輸入 0 或 none 可取消該項調整 (例如：boot_disk_gb=0, extra_disk_gb=200)；修改後會先回到此畫面確認，再按 [A] 執行。")
     decision = ask_review(review_request(
         kind="vm_disk",
         title="💽 待審核的硬碟調整 (Day-2)",
-        message=f"VM `{vm}` 的硬碟調整計畫，請人工審查確認。留空代表不執行該項。",
+        message=f"VM `{vm}` 的硬碟調整計畫，請人工審查確認。留空或填 0 代表不執行該項。",
         fields=[
             ReviewField(key="vm_name", label="VM 名稱", value=vm, editable=False),
             ReviewField(key="ip", label="IP", value=state.get("ip"), editable=False),
-            ReviewField(key="boot_disk_gb", label="系統碟擴充後的總大小 (GB)", value=boot or "(不調整)", editable=True),
-            ReviewField(key="extra_disk_gb", label="額外硬碟大小 (GB)", value=extra or "(不加掛)", editable=True),
+            ReviewField(
+                key="boot_disk_gb",
+                label="系統碟擴充後的總大小 (GB)",
+                value=boot or "(不調整)",
+                editable=True,
+                options="整數 GB；填 0 或 none 代表不調整",
+            ),
+            ReviewField(
+                key="extra_disk_gb",
+                label="額外硬碟大小 (GB)",
+                value=extra or "(不加掛)",
+                editable=True,
+                options="整數 GB；填 0 或 none 代表不加掛",
+            ),
             ReviewField(key="extra_disk_name", label="額外硬碟名稱 (Aria 會補 6 位流水號)",
                         value=extra_disk_name(vm) if extra else "", editable=False),
         ],
-        actions=[APPROVE, EDIT, SKIP],
+        actions=[APPROVE, EDIT_REVIEW, SKIP],
         errors=(state.get("blocking") or []) + (state.get("errors") or []),
-        notes=state.get("notes") or [],
+        notes=notes,
     ))
     feedback = decision.model_dump()
     if decision.action == "skip":
@@ -120,6 +134,8 @@ def route_review(state: DiskState) -> str:
     action = (state.get("human_feedback") or {}).get("action")
     if action == "skip":
         return END
+    if action == "edit":
+        return "review"
     return "review" if state.get("errors") or state.get("blocking") else "finalize"
 
 

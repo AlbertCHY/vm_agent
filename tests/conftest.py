@@ -1,7 +1,7 @@
 """測試共用設定
 
 在匯入任何專案模組前，把 policies / data / logs 導向暫存目錄：
-- policies 只放 *.example.toml 與 bootstrap_steps.toml，測試結果不受本機實際 policy 影響
+- policies 只放 *.example.toml 與 bootstrap_steps_{linux,windows}.toml，測試結果不受本機實際 policy 影響
 - data / logs 不會寫入專案目錄
 """
 import os
@@ -18,7 +18,8 @@ _POLICIES = _TMP / "policies"
 _POLICIES.mkdir()
 for f in (ROOT / "policies").glob("*.example.toml"):
     shutil.copy(f, _POLICIES / f.name)
-shutil.copy(ROOT / "policies" / "bootstrap_steps.toml", _POLICIES / "bootstrap_steps.toml")
+shutil.copy(ROOT / "policies" / "bootstrap_steps_linux.toml", _POLICIES / "bootstrap_steps_linux.toml")
+shutil.copy(ROOT / "policies" / "bootstrap_steps_windows.toml", _POLICIES / "bootstrap_steps_windows.toml")
 
 os.environ["POLICIES_DIR"] = str(_POLICIES)
 os.environ["DATA_DIR"] = str(_TMP / "data")

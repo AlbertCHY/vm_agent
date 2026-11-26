@@ -10,10 +10,11 @@ logs/
 data/
 
 # 大型安裝檔
-CrowdStrike/
+scripts/installers/
 
 # 含內部資訊的本機設定 (提交對應的 *.example.toml)
 prompts.local.toml
 policies/*.toml
 !policies/*.example.toml
-!policies/bootstrap_steps.toml
+!policies/bootstrap_steps_linux.toml
+!policies/bootstrap_steps_windows.toml

@@ -12,7 +12,7 @@ from rich.table import Table
 
 from cli.render import console
 from core.secrets import get_secret_store
-from subgraphs.common.review import ReviewDecision, parse_edits
+from subgraphs.common.review import SECRET_REF_PREFIX, ReviewDecision, parse_edits
 
 
 def _display_value(field: dict[str, Any]) -> str:
@@ -54,6 +54,24 @@ def render_request(request: dict[str, Any]) -> None:
                             title="❗ 驗證錯誤 (請修正後再送出)", border_style="red"))
 
 
+def _protect_secret_edits(fields: list[dict[str, Any]], edits: dict[str, str]) -> dict[str, str]:
+    """將機密欄位的修改值轉存本機記憶體 SecretStore，避免明文進入 Command(resume) 與 Checkpoint"""
+    secret_keys = {f.get("key"): f.get("secret_key") or f.get("key") for f in fields if f.get("secret_ref")}
+    if not secret_keys or not edits:
+        return edits
+    store = get_secret_store()
+    protected = dict(edits)
+    for key, raw in list(edits.items()):
+        if key not in secret_keys:
+            continue
+        val = raw
+        if val == "?":
+            val = Prompt.ask(f"請輸入 {key} 的新值 (支援含逗號與特殊字元)").strip()
+        ref = store.put({secret_keys[key]: val})
+        protected[key] = f"{SECRET_REF_PREFIX}{ref}"
+    return protected
+
+
 def handle_review(request: dict[str, Any]) -> dict[str, Any]:
     """顯示審核畫面並收集決策 (KeyboardInterrupt 會往外拋，流程保持暫停並由 CLI 自動詢問續跑或由 /jobs 繼續)"""
     console.print("\n[bold yellow]⚠️  觸發人工審查機制 (Human-In-The-Loop)[/bold yellow]")
@@ -75,10 +93,11 @@ def handle_review(request: dict[str, Any]) -> dict[str, Any]:
     edits: dict[str, str] = {}
     feedback = ""
     if action.get("needs_edits"):
-        editable = [f["key"] for f in request.get("fields") or [] if f.get("editable", True)]
+        fields = request.get("fields") or []
+        editable = [f["key"] for f in fields if f.get("editable", True)]
         console.print("[cyan]請輸入欲修改的參數與數值 (格式: key=value，多個以逗號分隔)[/cyan]")
         console.print(f"[dim]可修改欄位：{', '.join(editable)}[/dim]")
-        edits = parse_edits(Prompt.ask("修改內容"))
+        edits = _protect_secret_edits(fields, parse_edits(Prompt.ask("修改內容")))
     if action.get("needs_feedback"):
         prompt = "請輸入退回原因或調整需求" if action["action"] == "reject" else "請輸入原因 (可留空)"
         feedback = Prompt.ask(prompt, default="")

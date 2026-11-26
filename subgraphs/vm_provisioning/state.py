@@ -27,8 +27,14 @@ class VMIntent(BaseModel):
     ap_unit: Optional[str] = Field(None, description="應用單位 / 申請單位")
     db_owner: Optional[str] = Field(None, description="DB 負責人")
     description: Optional[str] = Field(None, description="用途說明 / 專案背景")
-    boot_disk_gb: Optional[int] = Field(None, description="系統碟擴充後的總大小 (GB)，使用者有提到才填")
-    extra_disk_gb: Optional[int] = Field(None, description="額外資料硬碟大小 (GB)，使用者有提到才填")
+    boot_disk_gb: Optional[int] = Field(
+        None,
+        description="系統碟 (根目錄 /) 擴充後的總大小 (GB)，只有使用者明確要求擴充系統碟或根目錄時才填",
+    )
+    extra_disk_gb: Optional[int] = Field(
+        None,
+        description="額外資料硬碟大小 (GB)；若使用者只提到硬碟容量 (例如 4C/8G/200G SSD) 而未指明擴充系統碟，一律填在此欄位",
+    )
 
 
 class ProvisioningState(TypedDict, total=False):

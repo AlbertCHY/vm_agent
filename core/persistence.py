@@ -1,10 +1,11 @@
 """持久化：LangGraph checkpointer (SQLite)、單一實例鎖與輕量的對話 / 流程 Session 紀錄
 
-- checkpoints.sqlite：LangGraph 的 SqliteSaver，Supervisor 與所有業務子圖 (含 VM 生命週期子圖) 共用，
+- checkpoints.sqlite：LangGraph 的 SqliteSaver，Supervisor 與所有業務子圖 (含背景工作子圖) 共用，
   中斷 (interrupt) 等待審核或程式異常結束後，都能以相同 thread_id 繼續。
 - app.sqlite：
-    * sessions           — 對話與 VM 生命週期子圖的 Session 索引 (thread_id、標題、類型、封存狀態)
+    * sessions           — 前景對話 Session 索引 (thread_id、標題、類型、封存狀態)
     * pipeline_sessions  — 子圖跨次呼叫需延續的資料 (例如 VM 開立補問欄位時暫存已解析規格)
+    * background_jobs    — 統一背景工作 (/jobs) 索引、串接 next_steps 與 stage 快取
 """
 import json
 import os
@@ -75,6 +76,7 @@ def delete_thread_checkpoints(thread_id: str, checkpointer=None) -> None:
 
 
 _SESSION_KEYS = ("thread_id", "title", "kind", "archived", "created_at", "updated_at")
+_JOB_KEYS = ("job_id", "thread_id", "kind", "title", "stage", "meta", "archived", "created_at", "updated_at")
 
 
 class AppStore:
@@ -101,11 +103,25 @@ class AppStore:
                     data       TEXT,
                     updated_at REAL
                 );
+                CREATE TABLE IF NOT EXISTS background_jobs (
+                    job_id     TEXT PRIMARY KEY,
+                    thread_id  TEXT NOT NULL,
+                    kind       TEXT NOT NULL,
+                    title      TEXT,
+                    stage      TEXT DEFAULT '',
+                    meta       TEXT,
+                    archived   INTEGER DEFAULT 0,
+                    created_at REAL,
+                    updated_at REAL
+                );
                 """
             )
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(background_jobs)").fetchall()}
+            if "stage" not in cols:
+                self._conn.execute("ALTER TABLE background_jobs ADD COLUMN stage TEXT DEFAULT ''")
             self._conn.commit()
 
-    # ─── 對話與生命週期 Session ───
+    # ─── 對話 Session ───
     def touch_session(self, thread_id: str, title: str, kind: str) -> None:
         now = time.time()
         with self._lock:
@@ -152,8 +168,7 @@ class AppStore:
         if exclude_kind:
             sql += " AND kind != ?"
             args.append(exclude_kind)
-        order = "ORDER BY created_at ASC" if kind == "vm_lifecycle" else "ORDER BY updated_at DESC"
-        sql += f" {order} LIMIT ?"
+        sql += " ORDER BY updated_at DESC LIMIT ?"
         args.append(limit)
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
@@ -180,6 +195,112 @@ class AppStore:
         with self._lock:
             self._conn.execute("DELETE FROM pipeline_sessions WHERE session_id=?", (session_id,))
             self._conn.commit()
+
+    # ─── 統一背景工作索引 (/jobs) ───
+    def save_job(
+        self,
+        job_id: str,
+        thread_id: str,
+        kind: str,
+        title: str,
+        meta: Optional[dict[str, Any]] = None,
+        stage: str = "",
+    ) -> None:
+        now = time.time()
+        meta_json = json.dumps(meta or {}, ensure_ascii=False, default=str)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO background_jobs(job_id, thread_id, kind, title, stage, meta, archived, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,0,?,?) "
+                "ON CONFLICT(job_id) DO UPDATE SET title=excluded.title, meta=excluded.meta, "
+                "stage=CASE WHEN excluded.stage != '' THEN excluded.stage ELSE background_jobs.stage END, "
+                "updated_at=excluded.updated_at",
+                (job_id, thread_id, kind, (title or "")[:120], stage or "", meta_json, now, now),
+            )
+            self._conn.commit()
+
+    def update_job_stage(self, job_id: str, stage: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE background_jobs SET stage=?, updated_at=? WHERE job_id=?",
+                (stage or "", time.time(), job_id),
+            )
+            self._conn.commit()
+
+    def get_job(self, job_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT job_id, thread_id, kind, title, stage, meta, archived, created_at, updated_at "
+                "FROM background_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+        if not row:
+            return None
+        d = dict(zip(_JOB_KEYS, row))
+        d["meta"] = json.loads(d["meta"]) if d.get("meta") else {}
+        return d
+
+    def update_job_meta(self, job_id: str, meta: dict[str, Any], title: Optional[str] = None) -> None:
+        now = time.time()
+        meta_json = json.dumps(meta, ensure_ascii=False, default=str)
+        with self._lock:
+            if title is not None:
+                self._conn.execute(
+                    "UPDATE background_jobs SET meta=?, title=?, updated_at=? WHERE job_id=?",
+                    (meta_json, title[:120], now, job_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE background_jobs SET meta=?, updated_at=? WHERE job_id=?",
+                    (meta_json, now, job_id),
+                )
+            self._conn.commit()
+
+    def archive_job(self, job_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE background_jobs SET archived=1, updated_at=? WHERE job_id=?",
+                (time.time(), job_id),
+            )
+            self._conn.commit()
+
+    def has_uncached_job_stages(self) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM background_jobs WHERE COALESCE(archived, 0) = 0 AND COALESCE(stage, '') = '' LIMIT 1"
+            ).fetchone()
+        return row is not None
+
+    def count_jobs_by_stages(self, stages: tuple[str, ...]) -> int:
+        if not stages:
+            return 0
+        placeholders = ",".join("?" for _ in stages)
+        sql = (
+            f"SELECT COUNT(*) FROM background_jobs "
+            f"WHERE COALESCE(archived, 0) = 0 AND stage IN ({placeholders})"
+        )
+        with self._lock:
+            row = self._conn.execute(sql, list(stages)).fetchone()
+        return int(row[0]) if row else 0
+
+    def list_jobs(self, limit: int = 200, include_archived: bool = False) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT job_id, thread_id, kind, title, stage, meta, archived, created_at, updated_at "
+            "FROM background_jobs WHERE 1=1"
+        )
+        args: list[Any] = []
+        if not include_archived:
+            sql += " AND COALESCE(archived, 0) = 0"
+        sql += " ORDER BY created_at ASC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(zip(_JOB_KEYS, r))
+            d["meta"] = json.loads(d["meta"]) if d.get("meta") else {}
+            out.append(d)
+        return out
 
 
 @lru_cache(maxsize=1)

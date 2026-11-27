@@ -21,7 +21,7 @@ from subgraphs.vm_disk.nodes import (
 from subgraphs.vm_disk.state import DiskState
 
 
-def build_vm_disk_graph(checkpointer=None):
+def build_vm_disk_graph(checkpointer=None, interrupt_after_finalize: bool = False):
     b = StateGraph(DiskState)
     b.add_node("locate", locate)
     b.add_node("review", review)
@@ -35,12 +35,15 @@ def build_vm_disk_graph(checkpointer=None):
     b.add_conditional_edges("review", route_review, {"review": "review", "finalize": "finalize", END: END})
     b.add_conditional_edges("finalize", route_after_finalize, {"submit_disk_op": "submit_disk_op", END: END})
     b.add_conditional_edges(
-        "submit_disk_op", route_after_submit, {"wait_disk_op": "wait_disk_op", "report": "report"}
+        "submit_disk_op", route_after_submit, {"wait_disk_op": "wait_disk_op", "report": "report", END: END}
     )
     b.add_conditional_edges(
         "wait_disk_op",
         route_after_wait,
-        {"wait_disk_op": "wait_disk_op", "submit_disk_op": "submit_disk_op", "report": "report"},
+        {"wait_disk_op": "wait_disk_op", "submit_disk_op": "submit_disk_op", "report": "report", END: END},
     )
     b.add_edge("report", END)
-    return b.compile(checkpointer=checkpointer)
+    compile_kwargs: dict = {"checkpointer": checkpointer}
+    if interrupt_after_finalize:
+        compile_kwargs["interrupt_after"] = ["finalize"]
+    return b.compile(**compile_kwargs)

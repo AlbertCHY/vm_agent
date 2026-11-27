@@ -19,9 +19,11 @@ from subgraphs.vm_bootstrap.nodes import (
 from subgraphs.vm_bootstrap.state import BootstrapState
 
 
-def build_vm_bootstrap_graph(checkpointer=None):
-    """checkpointer=None：嵌在 Supervisor 工具內執行 (沿用 Supervisor 的 checkpointer)；
-    追蹤工作 (/jobs) 獨立執行時傳入持久化 checkpointer"""
+def build_vm_bootstrap_graph(checkpointer=None, interrupt_before_exec: bool = False):
+    """
+    - checkpointer=None：嵌在 Supervisor 工具內執行 (沿用 Supervisor 的 checkpointer)；
+    - interrupt_before_exec=True：供統一背景工作 (/jobs) 使用，人工審核通過後停在 connect_and_upload 前並切入背景執行。
+    """
     builder = StateGraph(BootstrapState)
 
     builder.add_node("prepare_bootstrap", prepare_bootstrap)
@@ -50,4 +52,7 @@ def build_vm_bootstrap_graph(checkpointer=None):
     builder.add_edge("cleanup", "finalize")
     builder.add_edge("finalize", END)
 
-    return builder.compile(checkpointer=checkpointer)
+    compile_kwargs: dict = {"checkpointer": checkpointer}
+    if interrupt_before_exec:
+        compile_kwargs["interrupt_before"] = ["connect_and_upload"]
+    return builder.compile(**compile_kwargs)

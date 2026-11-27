@@ -23,6 +23,7 @@ from scripts.passwd_creator import generate_vm_passwords
 from subgraphs.common.review import (
     APPROVE, EDIT_REVIEW, REGENERATE, SECRET_REF_PREFIX, SKIP, ReviewField, ask_review, review_request,
 )
+from subgraphs.common.runner import is_cancelled
 from subgraphs.vm_bootstrap.state import BootstrapState
 from subgraphs.vm_bootstrap.steps import (
     SUPPORTED_OS_TYPES,
@@ -438,7 +439,7 @@ def route_review_result(state: BootstrapState) -> str:
     if action in ("regenerate", "edit") or state.get("validation_errors"):
         return "human_review"
     if action == "approve":
-        return "connect_and_upload"
+        return END if state.get("handoff_to_background") else "connect_and_upload"
     return END
 
 
@@ -518,7 +519,6 @@ def connect_and_upload(state: BootstrapState) -> dict[str, Any]:
     local_scripts = [scripts_dir / name for name in plan.script_files]
     extra_dirs: list[tuple[Path, str]] = []
     extra_files: list[tuple[Path, str]] = []
-    exclude_dir_names: set[str] = set()
 
     cs_enabled = (state.get("cs_mode") or "").upper() != "SKIP"
     if cs_enabled and config.CROWDSTRIKE_INSTALLERS_DIR.is_dir():
@@ -543,7 +543,6 @@ def connect_and_upload(state: BootstrapState) -> dict[str, Any]:
 
     if is_win and sccm_remote_dir and config.SCCM_INSTALLERS_DIR.is_dir():
         extra_dirs.append((config.SCCM_INSTALLERS_DIR, sccm_remote_dir))
-        # exclude_dir_names.add("i386")
 
     upload_hint = " (含 SCCM x64 / CrowdStrike 安裝檔，首次傳輸可能需數分鐘)" if is_win else ""
     emit(f"[Bootstrap] 正在透過 SFTP 上傳腳本與安裝檔至 {ip}:{remote_dir}{upload_hint} ...", stage="vm_bootstrap")
@@ -554,8 +553,6 @@ def connect_and_upload(state: BootstrapState) -> dict[str, Any]:
     )
     if extra_files:
         upload_kwargs["extra_files"] = extra_files
-    if exclude_dir_names:
-        upload_kwargs["exclude_dir_names"] = exclude_dir_names
     if is_win:
         upload_kwargs["os_type"] = "windows"
         upload_kwargs["transfer_timeout"] = 300
@@ -566,6 +563,16 @@ def connect_and_upload(state: BootstrapState) -> dict[str, Any]:
 
     step_results.append({"step": "0. SFTP 上傳腳本與安裝檔", "status": "success", "exit_code": 0,
                          "detail": f"已上傳 {len(uploaded_files)} 個檔案至 {remote_dir}"})
+    job_id = state.get("job_id") or ""
+    if job_id and is_cancelled(job_id):
+        return {
+            **updates,
+            "step_results": step_results,
+            "sub_stage": "cancelled",
+            "stopped": True,
+            "note": "使用者停止工作",
+            "execution_result": {"aborted": True, "reason": "使用者停止工作", "steps": step_results},
+        }
     return {**updates, "step_results": step_results, "step_index": 0, "stopped": False}
 
 
@@ -618,10 +625,15 @@ def run_step(state: BootstrapState) -> dict[str, Any]:
                         "detail": "本機記憶體中的密碼已遺失 (程式可能已重啟)，無法執行改密碼步驟"})
         return {**updates, "step_results": results, "stopped": True}
 
+    job_id = state.get("job_id") or ""
+    if job_id and is_cancelled(job_id):
+        return {"sub_stage": "cancelled", "stopped": True, "note": "使用者停止工作"}
+
     emit(f"[Bootstrap] ▶ 執行 {name} ...", stage="vm_bootstrap", step=step.id)
     ec, combined = _exec_step(state, step)
     if ec == 0:
         results.append({"step": name, "step_idx": idx, "status": "success", "exit_code": 0, "detail": combined[-400:]})
+        emit(f"[Bootstrap] ✅ 完成 {name}", stage="vm_bootstrap", step=step.id)
         if SSHD_RESTART_MARKER in combined:
             emit(f"[Bootstrap] ⏳ 已更新 sshd_config，等待 {state['ip']} 的 sshd 重啟就緒...", stage="vm_bootstrap")
             wait_fn = getattr(get_ssh_client(), "wait_port_ready", None)
@@ -635,8 +647,9 @@ def run_step(state: BootstrapState) -> dict[str, Any]:
             if state.get("login_mode") != "key":
                 updates["login_mode"] = "admin"
     else:
-        results.append({"step": name, "step_idx": idx, "status": "failed", "exit_code": ec,
-                        "detail": combined[-500:] or f"exit code {ec}"})
+        detail = combined[-500:] or f"exit code {ec}"
+        results.append({"step": name, "step_idx": idx, "status": "failed", "exit_code": ec, "detail": detail})
+        emit(f"[Bootstrap] ❌ 失敗 {name} (exit={ec})：{detail.splitlines()[-1][:120]}", stage="vm_bootstrap", step=step.id)
         if step.stop_on_fail:
             updates["stopped"] = True
     return {**updates, "step_results": results}
@@ -650,6 +663,8 @@ def route_next_step(state: BootstrapState) -> str:
 
 # 5. 清理 (Linux 無論前面步驟是否失敗一律清理；Windows 未設定 cleanup 則直接略過)
 def cleanup(state: BootstrapState) -> dict[str, Any]:
+    if state.get("sub_stage") == "cancelled":
+        return {}
     plan = get_bootstrap_plan(_os_type(state))
     step = plan.cleanup
     if step is None:
@@ -669,6 +684,13 @@ def finalize(state: BootstrapState) -> dict[str, Any]:
     plan = get_bootstrap_plan(os_type)
     ip, hostname, user1 = state.get("ip"), state.get("hostname"), state.get("user1")
     step_results = state.get("step_results") or []
+
+    if state.get("sub_stage") == "cancelled":
+        get_secret_store().delete(state.get("secret_ref"))
+        return {
+            "execution_result": {"aborted": True, "reason": "使用者停止工作", "steps": step_results},
+            "messages": [AIMessage(content=f"🛑 已停止對 {ip} ({hostname}) 的基本設定。")],
+        }
 
     if state.get("execution_result"):  # 連線或上傳階段已失敗
         get_secret_store().delete(state.get("secret_ref"))

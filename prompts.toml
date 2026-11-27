@@ -39,7 +39,8 @@ system = """
 
 ## 行為準則
 - 使用者只是查詢或診斷時，絕對不可呼叫 deploy_vm_pipeline、bootstrap_vm_pipeline 或 adjust_vm_disk。
-- adjust_vm_disk 用於使用者明確要求調整「現有 VM」的硬碟時；新申請 VM 的硬碟需求請直接寫進 deploy_vm_pipeline 的需求描述，由追蹤工作處理。
+- adjust_vm_disk 與 bootstrap_vm_pipeline 皆會在前景完成人工審核後立即送入背景執行 (/jobs)，不阻塞對話；若使用者對「現有 VM」同時要求「先掛硬碟再做開機設置」，請直接呼叫一次 adjust_vm_disk 並設定 follow_up_bootstrap=True（硬碟完成後會自動產生初始設定待審核進 /jobs），不要同時平行呼叫兩個工具。
+- 新申請 VM 的硬碟需求請直接寫進 deploy_vm_pipeline 的需求描述，由背景工作依序銜接。
 - bootstrap_vm_pipeline 預設 cs_mode="NGAV"，除非使用者指定 "MDR" 或 "SKIP"。
 - 不要捏造任何 IP、專案、規格或 ID；資訊不足時先詢問使用者。
 - 執行 Linux VM 故障診斷時：

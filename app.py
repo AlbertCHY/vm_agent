@@ -18,11 +18,12 @@ from cli.render import console
 from cli.session import check_startup_interrupted_session, resolve_dangling_interrupts, run_turn
 from core.logging_setup import setup_logging
 from core.persistence import acquire_background_lock
-from subgraphs.vm_lifecycle import (
+from subgraphs.jobs import (
     REVIEW_STAGES,
+    count_jobs_in_stages,
     drain_notices,
-    list_lifecycle_jobs,
-    resume_waiting_lifecycles,
+    resume_active_jobs,
+    running_background_task_ids,
 )
 from supervisor import SUPERVISOR_TOOLS, build_supervisor_agent
 from tools.ticket_tools import list_ticket_files
@@ -48,7 +49,7 @@ def display_welcome():
     tool_names = ", ".join(t.name for t in SUPERVISOR_TOOLS)
     welcome_text = (
         "[bold cyan]Aria Automation Cloud Ops Agent[/bold cyan]\n"
-        "[white]架構：Supervisor (ReAct) + Tools + 純 LangGraph 生命週期子圖 (原生 interrupt HITL) + Local Ollama 工單解析[/white]\n"
+        "[white]架構：Supervisor (ReAct) + Tools + 獨立 LangGraph 背景工作子圖 (/jobs，原生 interrupt HITL) + Local Ollama 工單解析[/white]\n"
         f"[dim]已載入工具：{tool_names}[/dim]\n"
         f"[dim]工單資料夾：{config.TICKETS_DIR}[/dim]\n"
         f"[dim]Debug 思考過程顯示：{'開啟' if config.SHOW_AGENT_THOUGHTS else '關閉'} (由 .env 的 SHOW_AGENT_THOUGHTS 設定)[/dim]"
@@ -119,11 +120,18 @@ def process_ticket_file(agent, filename: str):
 
 
 def _show_notices() -> str:
-    """印出背景生命週期子圖的通知，並回傳輸入提示 (有待審核工作時顯示數量)"""
+    """印出背景工作的完成/待審核通知，並回傳輸入提示 (有待審核工作時顯示數量)"""
     for notice in drain_notices():
         console.print(f"[bold yellow]{escape(notice)}[/bold yellow]")
-    waiting = len(list_lifecycle_jobs(stages=REVIEW_STAGES))
-    return "[bold blue]使用者[/bold blue]" + (f" [yellow](🔔 {waiting} 台待審核，/jobs)[/yellow]" if waiting else "")
+    waiting = count_jobs_in_stages(REVIEW_STAGES)
+    running = len(running_background_task_ids())
+    badges: list[str] = []
+    if waiting:
+        badges.append(f"🔔 {waiting} 項待審核")
+    if running:
+        badges.append(f"⏳ {running} 項背景執行中")
+    suffix = f" [yellow]({' / '.join(badges)}，/jobs)[/yellow]" if badges else ""
+    return "[bold blue]使用者[/bold blue]" + suffix
 
 
 def run_interactive(agent):
@@ -145,6 +153,15 @@ def run_interactive(agent):
 
         cmd = user_input.lower()
         if cmd in ("exit", "quit", "/exit", "/quit", "q"):
+            active_bg = running_background_task_ids()
+            if active_bg:
+                ans = Prompt.ask(
+                    f"[yellow]⚠️ 目前尚有 {len(active_bg)} 項背景工作執行中，確定中斷離開？(已完成步驟已保存於 Checkpoint)[/yellow]",
+                    choices=["y", "n"],
+                    default="n",
+                )
+                if ans != "y":
+                    continue
             console.print("[cyan]感謝使用，再見！[/cyan]")
             break
         if cmd == "/help":
@@ -169,8 +186,8 @@ def main():
     config.TICKETS_DIR.mkdir(parents=True, exist_ok=True)
     agent = build_supervisor_agent()
     if acquire_background_lock():
-        # 恢復上次未完成的背景 VM 生命週期等待節點 (wait_vm_ready / submit_disk_op / wait_disk_op)
-        resume_waiting_lifecycles()
+        # 恢復上次未完成的背景工作 (vm_build / vm_disk) 並推播待審核/待續提醒
+        resume_active_jobs()
     else:
         console.print("[yellow]⚠️ 偵測到另一個 CLI 實例正在執行背景追蹤；本視窗將不重複啟動背景輪詢。[/yellow]")
 

@@ -1,11 +1,15 @@
-"""VM Bootstrap：審核 (含重新產生密碼、密碼遺失) → 逐步執行，並確認密碼不外洩到命令列 / state"""
+"""VM Bootstrap：前景審核 (含重新產生密碼、密碼遺失) → 送入 /jobs 背景執行，並驗證機密零外洩與累計輸出"""
 import json
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from core.secrets import get_secret_store, set_credential_sink_factory
 from helpers import build_agent_calling, drive
+from subgraphs.jobs import DONE, get_job, get_job_logs, wait_for_background
 from subgraphs.vm_bootstrap import nodes
+from subgraphs.vm_bootstrap.graph import build_vm_bootstrap_graph
 from subgraphs.vm_bootstrap.tool import bootstrap_vm_pipeline
 
 
@@ -16,7 +20,6 @@ class FakeSSH:
         self.upload_remote_dir = ""
         self.upload_extra_dirs = []
         self.upload_extra_files = []
-        self.upload_exclude_dir_names = set()
         self.waited_sshd = []
         self.os_release = ""
 
@@ -36,7 +39,6 @@ class FakeSSH:
         username,
         password,
         extra_files=None,
-        exclude_dir_names=None,
         os_type="linux",
         transfer_timeout=120,
     ):
@@ -44,7 +46,6 @@ class FakeSSH:
         self.upload_remote_dir = remote_dir
         self.upload_extra_dirs = list(extra_dirs or [])
         self.upload_extra_files = list(extra_files or [])
-        self.upload_exclude_dir_names = set(exclude_dir_names or set())
         return 0, [f"{remote_dir}/{f.name}" for f in files], ""
 
     def exec_command(self, ip, cmd, username=None, password=None, sudo=False, sudo_password=None,
@@ -112,7 +113,7 @@ def test_bootstrap_flow_keeps_secrets_off_command_line(fakes):
 
     requests, tool_msg = drive(agent, decide)
 
-    # 重新產生後，審核畫面顯示新密碼；修改 cs_mode 後先回到審核畫面確認，再核准執行
+    # 重新產生後，審核畫面顯示新密碼；修改 cs_mode 後先回到審核畫面確認，再核准送入背景執行
     first, second, third = shown
     assert first["admin_password"] != second["admin_password"]
     assert second == third
@@ -120,7 +121,14 @@ def test_bootstrap_flow_keeps_secrets_off_command_line(fakes):
     assert "SKIP" in requests[2]["fields"][7]["value"]
     admin_pw, user2_pw = second["admin_password"], second["user2_password"]
 
-    assert tool_msg.artifact["status"] == "completed"
+    assert tool_msg.artifact["status"] == "submitted"
+    job_id = tool_msg.artifact["job_id"]
+    assert wait_for_background(job_id, timeout=5.0)
+    job = get_job(job_id)
+    assert job is not None and job.stage == DONE
+    logs = get_job_logs(job_id)
+    assert any("set_passwords.sh" in ln for ln in logs)
+
     executed = [c["cmd"].rsplit("/", 1)[-1] if c["cmd"].endswith((".sh", ".ps1")) else c["cmd"] for c in ssh.calls]
     assert executed == ["add_pub_key.sh", "set_no_passwd.sh", "set_hostname.sh", "set_passwords.sh",
                         "set_zabbix.sh", "remover.sh"]   # CrowdStrike / 磁碟依設定略過
@@ -135,8 +143,14 @@ def test_bootstrap_flow_keeps_secrets_off_command_line(fakes):
     assert zabbix_call["password"] == admin_pw
 
     assert len(sink.records) == 1 and admin_pw in sink.records[0][2].values()
-    # 明文密碼不進入 checkpoint 與給 LLM 的內容
-    blob = json.dumps(list(saver.storage.items()), default=str) + str(dict(saver.writes)) + tool_msg.content
+    # 明文密碼不進入 checkpoint、累計日誌與給 LLM 的內容
+    blob = (
+        json.dumps(list(saver.storage.items()), default=str)
+        + str(dict(saver.writes))
+        + tool_msg.content
+        + job.final_message
+        + "\n".join(logs)
+    )
     assert admin_pw not in blob and user2_pw not in blob
     # 完成後記憶體中的密碼即清除
     assert get_secret_store().get(requests[1]["fields"][4]["secret_ref"]) is None
@@ -173,9 +187,7 @@ def test_invalid_edit_returns_to_review(fakes):
 
 
 def test_resume_after_crash_continues_from_next_step(fakes):
-    """程式在步驟中途被中斷 (例如 Ctrl+C / 異常結束) 後，以相同 thread 繼續時從下一步續跑，不重做已完成步驟"""
-    from langgraph.types import Command
-
+    """子圖在步驟中途被中斷 (例如 Ctrl+C / 異常結束) 後，以相同 thread 繼續時從下一步續跑，不重做已完成步驟"""
     ssh, _ = fakes
     original = ssh.exec_command
     crashed = {"done": False}
@@ -187,22 +199,25 @@ def test_resume_after_crash_continues_from_next_step(fakes):
         return original(ip, cmd, **kw)
 
     ssh.exec_command = flaky
-    agent, _ = build_agent_calling(bootstrap_vm_pipeline, {"ip": "10.0.0.13", "cs_mode": "SKIP", "skip_disk": True})
+    g = build_vm_bootstrap_graph(checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "crash"}, "recursion_limit": 60}
 
-    agent.invoke({"messages": [("user", "go")]}, cfg)
-    itr = agent.get_state(cfg).interrupts[0]
+    g.invoke({
+        "ip": "10.0.0.13", "cs_mode": "SKIP", "skip_disk": True, "handoff_to_background": False,
+        "human_feedback": None, "validation_errors": [], "execution_result": None,
+        "step_results": [], "step_index": 0,
+    }, cfg)
+    itr = g.get_state(cfg).interrupts[0]
     with pytest.raises(KeyboardInterrupt):
-        agent.invoke(Command(resume={itr.id: {"action": "approve"}}), cfg)
+        g.invoke(Command(resume={itr.id: {"action": "approve"}}), cfg)
     assert [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls] == ["add_pub_key.sh", "set_no_passwd.sh"]
-    assert agent.get_state(cfg).next  # 仍有待執行節點，可於後續直接從斷點續跑
+    assert g.get_state(cfg).next  # 仍有待執行節點，可於後續直接從斷點續跑
 
-    agent.invoke(None, cfg)  # 續跑
+    g.invoke(None, cfg)  # 續跑
     executed = [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls]
     assert executed == ["add_pub_key.sh", "set_no_passwd.sh", "set_hostname.sh", "set_passwords.sh",
                         "set_zabbix.sh", "remover.sh"]
-    tool_msgs = [m for m in agent.get_state(cfg).values["messages"] if m.type == "tool"]
-    assert tool_msgs[-1].artifact["status"] == "completed"
+    assert (g.get_state(cfg).values.get("execution_result") or {}).get("success") is True
 
 
 def test_custom_password_edit_via_cli_review_never_leaks_to_checkpoint(fakes, monkeypatch):
@@ -234,7 +249,10 @@ def test_custom_password_edit_via_cli_review_never_leaks_to_checkpoint(fakes, mo
     assert len(requests) == 2
     assert shown[1]["admin_password"] == custom_admin
     assert shown[1]["user2_password"] == custom_user2
-    assert tool_msg.artifact["status"] == "completed"
+    assert tool_msg.artifact["status"] == "submitted"
+    job_id = tool_msg.artifact["job_id"]
+    assert wait_for_background(job_id, timeout=5.0)
+    assert get_job(job_id).stage == DONE
 
     pw_call = next(c for c in ssh.calls if c["cmd"].endswith("set_passwords.sh"))
     assert pw_call["secret_env"] == {"PW_ROOT": custom_admin, "PW_USER1": custom_admin, "PW_USER2": custom_user2}
@@ -286,10 +304,14 @@ def test_windows_bootstrap_flow_end_to_end(fakes, monkeypatch):
     admin_pw = shown[0]["admin_password"]
     user2_pw = shown[0]["user2_password"]
 
-    assert tool_msg.artifact["status"] == "completed"
-    # 驗證上傳至桌面 bootstrap 資料夾、機密暫存檔分開放 Temp、CrowdStrike 只傳 exe 且 SCCM 排除 i386
+    assert tool_msg.artifact["status"] == "submitted"
+    job_id = tool_msg.artifact["job_id"]
+    assert wait_for_background(job_id, timeout=5.0)
+    job = get_job(job_id)
+    assert job is not None and job.stage == DONE
+
+    # 驗證上傳至桌面 bootstrap 資料夾、機密暫存檔分開放 Temp、CrowdStrike 只傳 exe
     assert ssh.upload_remote_dir.endswith("/Desktop/bootstrap")
-    assert ssh.upload_exclude_dir_names == {"i386"}
     assert ssh.waited_sshd == ["10.0.0.30"]
     if ssh.upload_extra_files:
         assert all(p.name.lower().endswith(".exe") for p, _ in ssh.upload_extra_files)
@@ -322,9 +344,14 @@ def test_windows_bootstrap_flow_end_to_end(fakes, monkeypatch):
     assert len(sink.records) == 1
     assert all("root" not in k for k in sink.records[0][2])
     # 確認明文密碼不外洩
-    blob = json.dumps(list(saver.storage.items()), default=str) + str(dict(saver.writes)) + tool_msg.content
+    blob = (
+        json.dumps(list(saver.storage.items()), default=str)
+        + str(dict(saver.writes))
+        + tool_msg.content
+        + job.final_message
+    )
     assert admin_pw not in blob and user2_pw not in blob
-    assert "自動重開機" in tool_msg.content
+    assert "自動重開機" in job.final_message
 
 
 def test_linux_targeted_crowdstrike_upload(fakes, tmp_path, monkeypatch):
@@ -344,5 +371,6 @@ def test_linux_targeted_crowdstrike_upload(fakes, tmp_path, monkeypatch):
 
     agent, _ = build_agent_calling(bootstrap_vm_pipeline, {"ip": "10.0.0.31", "cs_mode": "NGAV", "skip_disk": True})
     _, tool_msg = drive(agent, lambda req: {"action": "approve"})
-    assert tool_msg.artifact["status"] == "completed"
+    assert tool_msg.artifact["status"] == "submitted"
+    assert wait_for_background(tool_msg.artifact["job_id"], timeout=5.0)
     assert ssh.upload_extra_dirs == [(cs_root / "RHEL_9", "/tmp/CrowdStrike/RHEL_9")]

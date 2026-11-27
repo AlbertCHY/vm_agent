@@ -1,8 +1,4 @@
-"""Day-2 硬碟動作共用輔助：定位機器、組合動作、冪等檢查與單次狀態查詢
-
-供前景子圖 (subgraphs.vm_disk) 與背景生命週期子圖 (subgraphs.vm_lifecycle) 共用，
-確保兩條路徑擁有一致的動作組合、冪等防呆與狀態判定規則。
-"""
+"""Day-2 硬碟動作共用輔助：定位機器、組合動作、冪等檢查與單次狀態查詢"""
 from typing import Any, Optional
 
 ADD_DISK = "Cloud.vSphere.Machine.Add.Disk"

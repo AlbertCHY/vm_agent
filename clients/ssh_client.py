@@ -591,7 +591,6 @@ class SSHClient:
         remote_dir: str = "/tmp",
         extra_dirs: Optional[list[tuple[Path, str]]] = None,
         extra_files: Optional[list[tuple[Path, str]]] = None,
-        exclude_dir_names: Optional[set[str]] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
         transfer_timeout: int = 120,
@@ -599,7 +598,6 @@ class SSHClient:
     ) -> tuple[int, list[str], str]:
         """
         透過 SFTP 批次上傳腳本檔案、指定檔案清單 (extra_files) 與附加資料夾 (extra_dirs)。
-        - exclude_dir_names：於遞迴 extra_dirs 時略過的資料夾名稱 (不分大小寫，例如 {"i386"})。
         - 附加安裝檔若遠端已存在且大小一致會略過重傳 (利於中斷續跑)。
 
         Returns:
@@ -612,7 +610,6 @@ class SSHClient:
             return err_code, [], err_msg
 
         sftp_remote_dir = self._to_sftp_path(remote_dir, os_type=os_type)
-        excluded = {d.lower() for d in (exclude_dir_names or set())}
         uploaded: list[str] = []
         try:
             sftp = client.open_sftp()
@@ -647,9 +644,6 @@ class SSHClient:
                     sftp_target_dir = self._to_sftp_path(target_remote_dir, os_type=os_type)
                     self._sftp_mkdir_p(sftp, sftp_target_dir)
                     for item in local_folder.rglob("*"):
-                        rel_parts = item.relative_to(local_folder).parts
-                        if excluded and any(part.lower() in excluded for part in rel_parts):
-                            continue
                         rel = item.relative_to(local_folder).as_posix()
                         rtarget = posixpath.join(sftp_target_dir, rel)
                         if item.is_dir():

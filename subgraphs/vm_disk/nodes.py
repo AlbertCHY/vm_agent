@@ -1,8 +1,7 @@
 """VM 硬碟調整子圖節點 (Day-2：定位 → 審核 → 送出單一動作 → 等待完成 → 報告)
 
-- submit_disk_op 採單動作送出並立即寫入 Checkpoint，送出 Add Disk 前具備冪等防呆檢查，
-  供前景工具 (adjust_vm_disk) 與背景生命週期子圖 (VMLifecycleGraph) 共用。
-- wait_disk_op 為前景同步等待節點；背景等待由 VMLifecycleGraph 使用同一套 poll_disk_op_once 驅動。
+- submit_disk_op 採單動作送出並立即寫入 Checkpoint，送出 Add Disk 前具備冪等防呆檢查。
+- wait_disk_op 透過共用 run_poll_loop 支援背景可中斷等待、逾時提醒與累計輸出。
 """
 import time
 from typing import Any, Callable, Optional
@@ -15,7 +14,7 @@ from clients.aria import get_aria_client
 from core.progress import emit
 from core.secrets import get_audit_sink
 from subgraphs.common.review import APPROVE, EDIT_REVIEW, SKIP, ReviewField, ask_review, review_request
-from subgraphs.common.runner import MAX_CONSECUTIVE_POLL_ERRORS
+from subgraphs.common.runner import MAX_CONSECUTIVE_POLL_ERRORS, is_cancelled, push_notice, run_poll_loop
 from subgraphs.vm_disk.executor import (
     ADD_DISK,
     RESIZE_BOOT_DISK,
@@ -156,6 +155,8 @@ def finalize(state: DiskState) -> dict[str, Any]:
 
 
 def route_after_finalize(state: DiskState) -> str:
+    if state.get("handoff_to_background"):
+        return END
     return "submit_disk_op" if state.get("ops") else END
 
 
@@ -164,6 +165,10 @@ def submit_disk_op(state: DiskState, aria: Any = None) -> dict[str, Any]:
     專職送出「單一」待執行的硬碟動作，取得 request_id 後立即 return 寫入 Checkpoint。
     送出 Add Disk 前會檢查 deployment 是否已存在同名磁碟 (冪等保護)。
     """
+    job_id = state.get("job_id") or ""
+    if job_id and is_cancelled(job_id):
+        return {"sub_stage": "cancelled", "note": "使用者停止追蹤"}
+
     client = aria or get_aria_client()
     machine_id = state["machine_id"]
     dep_id = state.get("deployment_id") or ""
@@ -198,6 +203,8 @@ def submit_disk_op(state: DiskState, aria: Any = None) -> dict[str, Any]:
 
 
 def route_after_submit(state: DiskState) -> str:
+    if state.get("sub_stage") == "cancelled":
+        return END
     if state.get("error"):
         return "report"
     ops = state.get("ops") or []
@@ -206,58 +213,72 @@ def route_after_submit(state: DiskState) -> str:
     return "wait_disk_op"
 
 
+def _check_disk_overdue(ops: list[dict[str, Any]], already_overdue: bool, now: float) -> Optional[str]:
+    if already_overdue:
+        return None
+    started = [op.get("submitted_at") for op in ops if op.get("status") == "running" and op.get("submitted_at")]
+    if started and (now - min(started)) / 60 > config.JOB_DAY2_TIMEOUT_MINUTES:
+        return f"硬碟調整動作已超過 {config.JOB_DAY2_TIMEOUT_MINUTES:g} 分鐘未完成"
+    return None
+
+
 def wait_disk_op(
     state: DiskState,
     sleep_fn: Optional[Callable[[float], None]] = None,
-    poll_s: float = FOREGROUND_POLL_INTERVAL,
+    poll_s: Optional[float] = None,
 ) -> dict[str, Any]:
-    """前景同步等待單一已送出的硬碟動作完成 (含逾時保護)"""
-    aria = get_aria_client()
-    wait = sleep_fn or time.sleep
+    """
+    專職輪詢「已送出且具備 request_id」的單一硬碟動作狀態 (絕不呼叫 run_resource_action)。
+    透過共用 run_poll_loop 支援背景可中斷等待、逾時提醒、連續錯誤退避與即時累計輸出。
+    """
+    job_id = state.get("job_id") or ""
+    label = state.get("deployment_name") or state.get("vm_name") or state.get("ip") or job_id or "VM"
     ops = [dict(op) for op in (state.get("ops") or [])]
     target_idx = next((i for i, op in enumerate(ops) if op.get("status") == "running" and op.get("request_id")), None)
     if target_idx is None:
         return {"ops": ops}
 
-    started = ops[target_idx].get("submitted_at") or time.time()
-    deadline = started + config.JOB_DAY2_TIMEOUT_MINUTES * 60
-    last_msg = ""
-    consecutive_errors = 0
+    interval = poll_s if poll_s is not None else (config.JOB_FAST_POLL_INTERVAL if job_id else FOREGROUND_POLL_INTERVAL)
+    last_msg = {"text": ""}
 
-    while True:
-        try:
-            outcome, ops, msg = poll_disk_op_once(aria, ops, target_idx)
-            consecutive_errors = 0
-        except Exception as e:
-            consecutive_errors += 1
-            now = time.time()
-            if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
-                err = f"{ops[target_idx]['label']} 狀態查詢連續失敗 ({type(e).__name__}: {e})；request_id={ops[target_idx].get('request_id')}"
-                return {"ops": ops, "error": err, "note": err, "last_checked": now}
-            emit(f"[硬碟調整] 查詢失敗 ({consecutive_errors}/{MAX_CONSECUTIVE_POLL_ERRORS})：{e}，稍後重試", stage="vm_disk")
-            wait(min(poll_s * (2 ** (consecutive_errors - 1)), 300))
-            continue
+    def _poll_once(current: dict[str, Any]) -> Optional[dict[str, Any]]:
         now = time.time()
-        if msg != last_msg:
+        outcome, updated_ops, msg = poll_disk_op_once(get_aria_client(), current["ops"], target_idx)
+        current["ops"] = updated_ops
+        if msg != last_msg["text"]:
             emit(f"[硬碟調整] {msg}", stage="vm_disk")
-            last_msg = msg
+            last_msg["text"] = msg
 
         if outcome == "success":
-            return {"ops": ops, "note": msg, "last_checked": now}
+            return {"ops": updated_ops, "note": msg, "stage_since": now, "overdue": False, "last_checked": now}
         if outcome == "failed":
-            return {"ops": ops, "error": msg, "note": msg, "last_checked": now}
-        if now > deadline:
-            timeout_msg = f"等待逾時：{msg}"
-            return {
-                "ops": ops,
-                "note": timeout_msg,
-                "last_checked": now,
-                "execution_result": {"state": "timeout", "message": timeout_msg, "ops": ops},
-            }
-        wait(poll_s)
+            return {"ops": updated_ops, "error": msg, "note": msg, "last_checked": now}
+
+        current.update(note=msg, last_checked=now)
+        reason = _check_disk_overdue(updated_ops, bool(current.get("overdue")), now)
+        if reason:
+            current["overdue"] = True
+            push_notice(f"⏰ {label} {reason}，請確認 Aria 狀態")
+            emit(f"[硬碟調整] ⏰ {reason}", stage="vm_disk")
+            return {"ops": updated_ops, "overdue": True, "note": msg, "last_checked": now}
+        return None
+
+    return run_poll_loop(
+        task_id=job_id,
+        label=f"{label} 硬碟狀態",
+        interval=interval,
+        max_backoff=300,
+        poll_once=_poll_once,
+        initial_progress={**state, "ops": ops},
+        wait_fn=sleep_fn,
+        max_errors=MAX_CONSECUTIVE_POLL_ERRORS,
+        error_label="硬碟輪詢",
+    )
 
 
 def route_after_wait(state: DiskState) -> str:
+    if state.get("sub_stage") == "cancelled":
+        return END
     if state.get("error") or state.get("execution_result"):
         return "report"
     ops = state.get("ops") or []

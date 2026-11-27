@@ -12,6 +12,7 @@
 import hashlib
 import logging
 import threading
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -20,9 +21,12 @@ from typing import Any, Callable, Optional
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphBubbleUp
 
+from core.progress import bind_background_task, register_background_sink
+
 logger = logging.getLogger(__name__)
 
 MAX_CONSECUTIVE_POLL_ERRORS = 5
+MAX_JOB_LOG_LINES = 300
 
 
 # ════════════════════════════════════════════════════════════════
@@ -83,10 +87,13 @@ def run_pipeline(
 _STATE_LOCK = threading.Lock()
 _NOTICES: deque[str] = deque()
 _LIVE_PROGRESS: dict[str, dict[str, Any]] = {}
+_JOB_LOGS: dict[str, deque[str]] = {}
 _CANCELLED_TASKS: set[str] = set()
 _ACTIVE_THREADS: dict[str, threading.Thread] = {}
 _TASK_LOCKS: dict[str, threading.RLock] = {}
 _WAKE_EVENTS: dict[str, threading.Event] = {}
+_PENDING_FINALIZE: dict[str, Callable[[], None]] = {}
+_RELEASE_LOCK_ON_EXIT: set[str] = set()
 
 
 def _get_wake_event(task_id: str) -> threading.Event:
@@ -112,11 +119,50 @@ def drain_notices() -> list[str]:
     return items
 
 
+def append_job_log(task_id: str, message: str) -> None:
+    """追加一筆帶時間戳的累計輸出給指定背景工作，供 /jobs 選中該任務時查閱"""
+    if not task_id or not message:
+        return
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {message}"
+    with _STATE_LOCK:
+        buf = _JOB_LOGS.get(task_id)
+        if buf is None:
+            buf = deque(maxlen=MAX_JOB_LOG_LINES)
+            _JOB_LOGS[task_id] = buf
+        buf.append(line)
+
+
+def get_job_logs(task_id: str) -> list[str]:
+    """取得指定工作到目前為止累計的輸出紀錄"""
+    with _STATE_LOCK:
+        buf = _JOB_LOGS.get(task_id)
+        return list(buf) if buf else []
+
+
 def set_live_progress(task_id: str, updates: dict[str, Any]) -> None:
     if not task_id:
         return
     with _STATE_LOCK:
         _LIVE_PROGRESS[task_id] = dict(updates)
+
+
+def update_live_progress(task_id: str, updates: dict[str, Any]) -> None:
+    """合併更新即時進度快取 (不覆蓋其他已存在欄位)"""
+    if not task_id:
+        return
+    with _STATE_LOCK:
+        cur = dict(_LIVE_PROGRESS.get(task_id) or {})
+        cur.update(updates)
+        _LIVE_PROGRESS[task_id] = cur
+
+
+def _on_bg_emit(task_id: str, message: str) -> None:
+    append_job_log(task_id, message)
+    update_live_progress(task_id, {"note": message, "last_checked": time.time()})
+
+
+register_background_sink(_on_bg_emit)
 
 
 def get_live_progress(task_id: str) -> dict[str, Any]:
@@ -177,20 +223,54 @@ def get_job_lock(task_id: str) -> threading.RLock:
 
 
 def cleanup_task_resources(task_id: str) -> None:
-    """清理已封存或取消任務的記憶體快取、喚醒事件與執行鎖"""
+    """清理已封存或取消任務的記憶體快取、累計輸出、喚醒事件與執行鎖。
+    若對應背景執行緒仍在執行中，先保留執行鎖並標記於執行緒退出時回收，避免鎖洩漏或競態。
+    """
     with _STATE_LOCK:
         _LIVE_PROGRESS.pop(task_id, None)
+        _JOB_LOGS.pop(task_id, None)
         _CANCELLED_TASKS.discard(task_id)
         _WAKE_EVENTS.pop(task_id, None)
+        _PENDING_FINALIZE.pop(task_id, None)
         t = _ACTIVE_THREADS.get(task_id)
-        if not (t and t.is_alive()):
+        if t and t.is_alive():
+            _RELEASE_LOCK_ON_EXIT.add(task_id)
+        else:
             _TASK_LOCKS.pop(task_id, None)
+            _RELEASE_LOCK_ON_EXIT.discard(task_id)
+
+
+def defer_task_finalize(task_id: str, finalize_fn: Callable[[], None]) -> bool:
+    """若背景執行緒仍在執行中，保留取消旗標並登記待執行緒結束後再執行 finalize_fn (回傳 False)；
+    若執行緒已結束則立即執行 finalize_fn 並回傳 True。
+    """
+    with _STATE_LOCK:
+        t = _ACTIVE_THREADS.get(task_id)
+        if t and t.is_alive():
+            _PENDING_FINALIZE[task_id] = finalize_fn
+            _RELEASE_LOCK_ON_EXIT.add(task_id)
+            return False
+    finalize_fn()
+    return True
+
+
+def is_cancelling(task_id: str) -> bool:
+    """任務已被要求停止，但背景執行緒仍在等待目前遠端操作收尾"""
+    with _STATE_LOCK:
+        t = _ACTIVE_THREADS.get(task_id)
+        return (task_id in _CANCELLED_TASKS or task_id in _PENDING_FINALIZE) and bool(t and t.is_alive())
 
 
 def is_background_running(task_id: str) -> bool:
     with _STATE_LOCK:
         t = _ACTIVE_THREADS.get(task_id)
         return bool(t and t.is_alive())
+
+
+def running_background_task_ids() -> list[str]:
+    """回傳目前仍在執行中的背景任務 ID 清單"""
+    with _STATE_LOCK:
+        return [tid for tid, t in _ACTIVE_THREADS.items() if t and t.is_alive()]
 
 
 def wait_for_background(task_id: str, timeout: float = 5.0) -> bool:
@@ -260,10 +340,12 @@ def spawn_background_graph(
     graph: Any,
     run_config: dict[str, Any],
     name_prefix: str = "lg-bg",
+    on_complete: Optional[Callable[[str], None]] = None,
 ) -> None:
     """
-    在背景 Daemon 執行緒中呼叫 graph.invoke(None, config=run_config)，
-    推進等待節點直到遇到下一個人工審核 interrupt() 或 END 自動結束並釋放執行緒。
+    在背景 Daemon 執行緒中綁定 task_id 並呼叫 graph.invoke(None, config=run_config)，
+    推進等待／執行節點直到遇到下一個中斷點或 END 自動結束並釋放執行緒；
+    執行完畢無例外時呼叫 on_complete(task_id) 處理完成通知或串接下一步。
     """
     task_lock = get_job_lock(task_id)
 
@@ -273,16 +355,40 @@ def spawn_background_graph(
             return
 
         def _runner():
+            succeeded = False
             try:
                 with task_lock:
-                    graph.invoke(None, config=run_config)
+                    with bind_background_task(task_id):
+                        graph.invoke(None, config=run_config)
+                    succeeded = True
+                    if on_complete is not None:
+                        on_complete(task_id)
             except Exception as e:
                 logger.exception("背景子圖推進失敗 (task=%s)", task_id)
-                set_live_progress(task_id, {"note": f"背景推進暫停 ({type(e).__name__}: {e}) — 可於 /jobs 按 [C] 重試"})
+                append_job_log(task_id, f"❌ 背景執行發生例外：{type(e).__name__}: {e}")
+                update_live_progress(
+                    task_id,
+                    {"note": f"背景推進暫停 ({type(e).__name__}: {e}) — 可於 /jobs 按 [C] 重試"},
+                )
             finally:
+                if succeeded:
+                    clear_live_progress(task_id)
                 clear_cancelled(task_id)
                 with _STATE_LOCK:
                     _ACTIVE_THREADS.pop(task_id, None)
+                    pending_fn = _PENDING_FINALIZE.pop(task_id, None)
+                    release_lock = task_id in _RELEASE_LOCK_ON_EXIT
+                    _RELEASE_LOCK_ON_EXIT.discard(task_id)
+                if pending_fn is not None:
+                    try:
+                        pending_fn()
+                    except Exception:
+                        logger.exception("背景任務延遲收尾失敗 (task=%s)", task_id)
+                if release_lock or pending_fn is not None:
+                    with _STATE_LOCK:
+                        t_now = _ACTIVE_THREADS.get(task_id)
+                        if not (t_now and t_now.is_alive()):
+                            _TASK_LOCKS.pop(task_id, None)
 
         t = threading.Thread(target=_runner, name=f"{name_prefix}-{task_id}", daemon=True)
         _ACTIVE_THREADS[task_id] = t

@@ -1,4 +1,4 @@
-"""VM Provisioning (catalog 版)：Supervisor → 工具 → 子圖 interrupt 冒泡 → 審核恢復 → catalog 送出與 VMLifecycleGraph 建立"""
+"""VM Provisioning (catalog 版)：Supervisor → 工具 → 子圖 interrupt 冒泡 → 審核恢復 → catalog 送出與背景追蹤工作 (vm_build) 建立"""
 import json
 
 import pytest
@@ -7,7 +7,7 @@ from conftest import FIXTURES
 from clients.aria.forms import build_form_fields
 from clients.aria.models import CatalogItem, CatalogRequestResult, CatalogVersion
 from helpers import build_agent_calling, drive
-from subgraphs.vm_lifecycle import get_lifecycle_job
+from subgraphs.jobs import get_job
 from subgraphs.vm_provisioning import nodes, reasoning
 from subgraphs.vm_provisioning.state import VMIntent
 from subgraphs.vm_provisioning.tool import deploy_vm_pipeline
@@ -91,7 +91,7 @@ def aria(monkeypatch):
     fake = FakeAria()
     monkeypatch.setattr(nodes, "get_aria_client", lambda: fake)
     # 測試時不啟動實際背景執行緒輪詢，確保初始狀態可確定性檢查
-    monkeypatch.setattr("subgraphs.vm_lifecycle.service.spawn_background_continuation", lambda *a, **k: None)
+    monkeypatch.setattr("subgraphs.jobs.manager.spawn_job_background", lambda *a, **k: None)
     return fake
 
 
@@ -128,8 +128,8 @@ def test_full_flow_edit_static_ip_then_submit(aria, monkeypatch):
     assert inputs["Datastore"] == "datastore-ssd" and inputs["sg"] == "ap" and inputs["DBOwner"] == ""
     assert "description" not in inputs and "project" not in inputs
     assert tool_msg.artifact["status"] == "submitted"
-    job = get_lifecycle_job(tool_msg.artifact["job_id"])     # 送出後自動初始化 VMLifecycleGraph Checkpoint
-    assert job.stage == "submitted" and job.deployment_id == "dep-1" and job.is_linux
+    job = get_job(tool_msg.artifact["job_id"])     # 送出後自動建立 vm_build 背景工作並串接 next_steps
+    assert job.kind == "vm_build" and job.stage == "waiting" and job.deployment_id == "dep-1" and job.os_type == "linux"
     assert "追蹤工作" in tool_msg.content
     # 審核修改後重新解析時，模型的選擇沿用快取
     assert llm.calls == {"VMIntent": 1, "TemplateChoice": 1, "OsImageChoice": 1}
@@ -190,8 +190,8 @@ def test_reject_clears_choice_cache_and_reparses_intent(aria, monkeypatch):
     assert tool_msg.artifact["status"] == "submitted"
 
 
-def test_deploy_with_track_false_skips_lifecycle_job(aria, monkeypatch):
-    """驗證 track=False 時僅送出申請，不建立生命週期追蹤工作"""
+def test_deploy_with_track_false_skips_tracking_job(aria, monkeypatch):
+    """驗證 track=False 時僅送出申請，不建立背景追蹤工作"""
     _use_llm(monkeypatch, [BASE_INTENT])
     agent, _ = build_agent_calling(
         deploy_vm_pipeline, {"requirement_description": "在 proj-demo 開 Oracle 9.6", "track": False}

@@ -1,85 +1,87 @@
-"""純 LangGraph 驅動的 VM 生命週期子圖測試 (100% 驅動真實節點，不使用模擬跳步函式)：
-1. wait_vm_ready 真實節點迴圈：INITIALIZATION → APPROVAL_PENDING (SUBMITTED) → INPROGRESS (寫入 BUILDING Checkpoint) → SUCCESSFUL → disk_review interrupt
-2. 驗證 Resume 時不會重新執行前置的狀態掃描 (wait_vm_ready 不重跑)
-3. 驗證 submit_disk_op 與 wait_disk_op 分離：在送出 Add Disk 後、查詢狀態中途 Crash 重啟，絕不會重複送出第 2 次申請 (含磁碟已存在之冪等防呆測試)
-4. 驗證初始設定 (Bootstrap) 在第 3 步被 Ctrl+C 中斷後，階段顯示為 BOOTSTRAP_RUNNING，進入 /jobs 會直接從第 3 步續跑，不重設也不重跑前 2 步
-5. 驗證連續輪詢失敗達上限時自動推播通知並停止無限重試
+"""統一背景工作 (/jobs) 整合測試：
+1. 三個獨立可背景執行子圖 (vm_build / vm_disk / vm_bootstrap) 與 next_steps 串接
+2. 驗證背景執行時 emit() 累積寫入 get_job_logs(job_id)，不搶主畫面輸出，完成/失敗時推播通知
+3. 驗證現有 VM 的 adjust_vm_disk 前景審核後進背景，以及 follow_up_bootstrap=True 自動串接初始設定
+4. 驗證 Add Disk 冪等防呆 (不重複送出) 與連續查詢失敗上限停止重試
+5. 驗證 Bootstrap 步驟失敗後自動切入 RETRY 保留已完成步驟，於 /jobs 續跑時從失敗步驟接續
+6. 驗證真實背景執行緒端對端流程 (vm_build → vm_disk → vm_bootstrap)
 """
-import json
 import time
-from collections import deque
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 import cli.jobs as jobs_cli
-import cli.review as review_mod
+from core.persistence import AppStore
 from helpers import build_agent_calling, drive
-from subgraphs.vm_bootstrap.state import BootstrapState
-from subgraphs.vm_disk import nodes as disk_nodes
-from subgraphs.vm_disk import tool as disk_tool
-from subgraphs.vm_disk.executor import ADD_DISK, RESIZE_BOOT_DISK
-from subgraphs.vm_disk.state import DiskState
-from subgraphs.vm_lifecycle import (
-    BOOTSTRAP_REVIEW,
-    BOOTSTRAP_RUNNING,
-    BUILDING,
-    DISK_REVIEW,
-    DISK_RUNNING,
+from subgraphs.common.runner import MAX_CONSECUTIVE_POLL_ERRORS, drain_notices, wait_for_background
+from subgraphs.jobs import (
     DONE,
     FAILED,
-    SUBMITTED,
-    VMLifecycleState,
-    build_vm_lifecycle_graph,
-    drain_notices,
-    get_lifecycle_job,
-    lifecycle_config,
-    start_lifecycle_job,
+    KIND_BOOTSTRAP,
+    KIND_BUILD,
+    KIND_DISK,
+    RETRY,
+    REVIEW,
+    WAITING,
+    cancel_job,
+    get_job,
+    get_job_graph,
+    get_job_logs,
+    job_config,
+    list_jobs,
+    start_build_job,
 )
-from subgraphs.vm_lifecycle import nodes as lc_nodes
+from subgraphs.vm_build import nodes as build_nodes
+from subgraphs.vm_disk import nodes as disk_nodes
+from subgraphs.vm_disk.executor import ADD_DISK, RESIZE_BOOT_DISK
+from subgraphs.vm_disk.tool import adjust_vm_disk
 from test_bootstrap_flow import fakes  # noqa: F401
-from tools.job_tools import track_vm_jobs
 
 
 class FakeDeployments:
     def __init__(self):
-        self.dep_status = {"dep-1": [("APPROVAL_PENDING", "CREATE_INPROGRESS")]}
-        self.request_status: dict[str, list[str]] = {}
-        self.submitted = []
-        self.get_calls = 0
-        self.extra_resources: list[dict] = []
+        self.dep_status: dict[str, list[tuple[str, str]]] = {}
+        self._resources: dict[str, list[dict]] = {
+            "dep-1": [
+                {"id": "m-1", "type": "Cloud.vSphere.Machine", "name": "proj-demo-AP01",
+                 "properties": {"address": "10.0.0.99", "resourceName": "proj-demo-AP01"}},
+            ]
+        }
+        self.actions = [
+            {"id": RESIZE_BOOT_DISK, "valid": True},
+            {"id": ADD_DISK, "valid": True},
+        ]
+        self.submitted: list[tuple[str, str, dict]] = []
+        self.req_status: dict[str, list[str]] = {}
 
     def get(self, dep_id, expand=None):
-        self.get_calls += 1
-        seq = self.dep_status[dep_id]
-        r, d = seq[0] if len(seq) == 1 else seq.pop(0)
-        return {"status": d, "lastRequest": {"status": r}}
+        seq = self.dep_status.get(dep_id) or [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
+        r_status, d_status = seq.pop(0) if len(seq) > 1 else seq[0]
+        return {"id": dep_id, "status": d_status, "lastRequest": {"status": r_status}}
 
     def resources(self, dep_id):
-        base = [{"id": "res-m1", "type": "Cloud.vSphere.Machine",
-                 "properties": {"resourceName": "proj-demo035404", "address": "10.0.0.60"}}]
-        return base + list(self.extra_resources)
+        return list(self._resources.get(dep_id, []))
 
-    def resource_actions(self, rid):
-        return [{"id": RESIZE_BOOT_DISK, "valid": True}, {"id": ADD_DISK, "valid": True}]
+    def resource_actions(self, machine_id):
+        return list(self.actions)
 
-    def resource_action(self, rid, aid):
-        return {"schema": {"properties": {"capacityGb": {"default": 60}}}}
+    def resource_action(self, machine_id, action_id):
+        return {"schema": {"properties": {"capacityGb": {"default": 100}}}}
 
-    def run_resource_action(self, rid, aid, inputs, reason=""):
-        rid_req = f"req-{len(self.submitted) + 1}"
-        self.submitted.append((rid, aid, inputs))
-        self.request_status.setdefault(rid_req, ["INPROGRESS", "SUCCESSFUL"])
-        return {"id": rid_req}
+    def run_resource_action(self, machine_id, action_id, inputs, reason=""):
+        self.submitted.append((machine_id, action_id, dict(inputs)))
+        return {"id": f"req-{len(self.submitted)}"}
 
-    def get_request(self, req_id):
-        seq = self.request_status[req_id]
-        return {"status": seq[0] if len(seq) == 1 else seq.pop(0)}
+    def get_request(self, request_id):
+        seq = self.req_status.get(request_id) or ["SUCCESSFUL"]
+        status = seq.pop(0) if len(seq) > 1 else seq[0]
+        return {"id": request_id, "status": status}
 
 
 class FakeIaas:
     def find_machines_by_ip(self, ip):
-        return [{"deploymentId": "dep-1", "name": "proj-demo035404"}] if ip == "10.0.0.60" else []
+        return [{"id": "iaas-m-1", "deploymentId": "dep-1", "name": "proj-demo-AP01", "address": ip}]
 
 
 class FakeAria:
@@ -87,233 +89,170 @@ class FakeAria:
         self.deployments = FakeDeployments()
         self.iaas = FakeIaas()
 
+    def query_vm_by_ip(self, ip):
+        return {
+            "found": True,
+            "deployment": {"id": "dep-1", "name": "proj-demo-AP01"},
+            "machine": {"id": "m-1", "name": "proj-demo-AP01", "address": ip, "os_type": "Ubuntu_24"},
+        }
+
 
 @pytest.fixture
-def lc_graph(monkeypatch):
+def job_env(tmp_path, monkeypatch):
+    store = AppStore(tmp_path / "app.sqlite")
+    cp = InMemorySaver()
+    monkeypatch.setattr("core.persistence.get_app_store", lambda: store)
+    monkeypatch.setattr("subgraphs.jobs.manager.get_app_store", lambda: store)
+    monkeypatch.setattr("subgraphs.jobs.manager.get_checkpointer", lambda: cp)
+    from subgraphs.jobs import manager as jm
+    jm._default_bg_graph.cache_clear()
+    monkeypatch.setattr(build_nodes.config, "JOB_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(disk_nodes.config, "JOB_FAST_POLL_INTERVAL", 0.01)
     drain_notices()
-    g = build_vm_lifecycle_graph(checkpointer=InMemorySaver())
-    monkeypatch.setattr("subgraphs.vm_lifecycle.graph.get_vm_lifecycle_graph", lambda: g)
-    monkeypatch.setattr("subgraphs.common.runner.wait_for_next_poll", lambda timeout, task_id=None: None)
-    return g
+    yield cp
+    jm._default_bg_graph.cache_clear()
 
 
-def _new_job(lc_graph, **kw):
-    base = dict(
-        deployment_id="dep-1",
-        deployment_name="proj-demo-AP03",
-        project="proj-demo",
-        is_linux=True,
-        auto_start=False,
-        graph=lc_graph,
-    )
-    base.update(kw)
-    return start_lifecycle_job(**base)
-
-
-def test_real_wait_node_transitions_and_stops_at_disk_review_without_replaying_scan(lc_graph, monkeypatch):
-    """直接以 lc_graph.invoke(None, cfg) 驅動真實 wait_vm_ready 節點，並驗證 Resume 時不重跑掃描"""
+def test_build_job_chains_to_disk_and_bootstrap_in_background(job_env, fakes, monkeypatch):  # noqa: F811
+    """端對端驗證真實背景執行緒：vm_build → (自動串接) vm_disk 審核 + 背景執行 → (自動串接) vm_bootstrap 審核 + 背景執行"""
+    ssh, _ = fakes
     aria = FakeAria()
+    monkeypatch.setattr(build_nodes, "get_aria_client", lambda: aria)
     monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
 
-    # 先測試送出後處於 INITIALIZATION -> APPROVAL_PENDING -> 轉為 INPROGRESS 時 wait_vm_ready 會先存檔 BUILDING Checkpoint
     aria.deployments.dep_status["dep-1"] = [
-        ("INITIALIZATION", "CREATE_INPROGRESS"),
         ("APPROVAL_PENDING", "CREATE_INPROGRESS"),
         ("INPROGRESS", "CREATE_INPROGRESS"),
         ("SUCCESSFUL", "CREATE_SUCCESSFUL"),
     ]
-    job = _new_job(lc_graph, extra_disk_gb=100)
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == SUBMITTED
+    aria.deployments.req_status["req-1"] = ["INPROGRESS", "SUCCESSFUL"]
+    aria.deployments.req_status["req-2"] = ["SUCCESSFUL"]
 
-    # 驅動真實節點：wait_vm_ready 內部經過 INITIALIZATION -> APPROVAL_PENDING -> INPROGRESS (存檔 BUILDING) -> SUCCESSFUL -> 停在 disk_review interrupt!
-    lc_graph.invoke(None, config=lifecycle_config(job.id))
+    # 1. 建立 vm_build 背景工作 (附帶 boot+extra disk 與 bootstrap 串接)
+    build_job = start_build_job(
+        deployment_id="dep-1",
+        deployment_name="proj-demo-AP01",
+        is_linux=True,
+        boot_disk_gb=150,
+        extra_disk_gb=200,
+        auto_start=True,
+    )
+    assert wait_for_background(build_job.id, timeout=5.0)
 
-    j = get_lifecycle_job(job.id, graph=lc_graph)
-    assert j.stage == DISK_REVIEW and j.ip == "10.0.0.60" and j.machine_id == "res-m1"
-    assert j.vm_name == "proj-demo035404"
-    notices = drain_notices()
-    assert any("硬碟調整" in n and "/jobs" in n for n in notices)
+    # vm_build 完成後應自動封存並長出 vm_disk (REVIEW)
+    active = list_jobs()
+    assert len(active) == 1
+    disk_job = active[0]
+    assert disk_job.kind == KIND_DISK and disk_job.stage == REVIEW and disk_job.ip == "10.0.0.99"
+    assert any("硬碟調整" in n for n in drain_notices())
 
-    calls_before_resume = aria.deployments.get_calls
-    assert calls_before_resume == 4
+    # 2. 進 /jobs 審核硬碟調整 (核准後立刻進背景執行)
+    monkeypatch.setattr(jobs_cli, "handle_review", lambda req: {"action": "approve", "edits": {}, "feedback": ""})
+    jobs_cli.run_job_review(disk_job.id)
+    assert wait_for_background(disk_job.id, timeout=5.0)
+    assert [a for _, a, _ in aria.deployments.submitted] == [RESIZE_BOOT_DISK, ADD_DISK]
 
-    # 使用者於 /jobs 執行 Resume 核准硬碟調整：驗證絕對不會重跑 wait_vm_ready！
-    answers = deque(["a"])
-    monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
-    monkeypatch.setattr(jobs_cli, "spawn_background_continuation", lambda *a, **k: None)
-    jobs_cli.run_disk_review(job.id, graph=lc_graph)
+    # vm_disk 完成後自動封存並長出 vm_bootstrap (REVIEW)
+    active = list_jobs()
+    assert len(active) == 1
+    boot_job = active[0]
+    assert boot_job.kind == KIND_BOOTSTRAP and boot_job.stage == REVIEW and boot_job.os_type == "linux"
+    assert any("初始設定" in n for n in drain_notices())
 
-    assert aria.deployments.get_calls == calls_before_resume   # 0 次重跑！
-    j_after = get_lifecycle_job(job.id, graph=lc_graph)
-    assert j_after.stage == DISK_RUNNING
-    assert [op["action_id"] for op in j_after.disk_ops] == [ADD_DISK]
+    # 3. 進 /jobs 審核初始設定 (核准後立刻進背景逐步執行並累積輸出)
+    monkeypatch.setattr(
+        jobs_cli,
+        "handle_review",
+        lambda req: {"action": "approve", "edits": {"cs_mode": "skip", "skip_disk": "true"}, "feedback": ""},
+    )
+    jobs_cli.run_job_review(boot_job.id)
+    assert wait_for_background(boot_job.id, timeout=5.0)
 
-
-def test_crash_after_submit_disk_op_does_not_resubmit(lc_graph, monkeypatch):
-    """
-    實測問題 1 驗證：
-    在 Add Disk 送出後 (submit_disk_op 完成)、查詢狀態時 (wait_disk_op 內) 行程中斷，
-    再從 Checkpoint 續跑，驗證 request_id 已寫入 Checkpoint，Aria 只會收到 1 次申請！
-    """
-    aria = FakeAria()
-    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
-    aria.deployments.dep_status["dep-1"] = [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
-
-    job = _new_job(lc_graph, extra_disk_gb=100)
-    lc_graph.invoke(None, config=lifecycle_config(job.id))
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == DISK_REVIEW
-
-    # 核准硬碟調整 (停在 disk_finalize 之後、submit_disk_op 之前)
-    answers = deque(["a"])
-    monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
-    monkeypatch.setattr(jobs_cli, "spawn_background_continuation", lambda *a, **k: None)
-    jobs_cli.run_disk_review(job.id, graph=lc_graph)
-
-    # 模擬在 get_request 查詢狀態時行程中斷 (KeyboardInterrupt)
-    orig_get_request = aria.deployments.get_request
-    crashed = {"once": False}
-
-    def crash_on_poll(req_id):
-        if not crashed["once"]:
-            crashed["once"] = True
-            raise KeyboardInterrupt("simulated crash during wait_disk_op")
-        return orig_get_request(req_id)
-
-    aria.deployments.get_request = crash_on_poll
-    with pytest.raises(KeyboardInterrupt):
-        lc_graph.invoke(None, config=lifecycle_config(job.id))
-
-    # 確認此時 Add Disk 已送出 1 次，且 Checkpoint 停在 wait_disk_op (帶有 request_id)
-    assert len(aria.deployments.submitted) == 1
-    state_mid = lc_graph.get_state(lifecycle_config(job.id))
-    assert state_mid.next == ("wait_disk_op",)
-    assert state_mid.values["ops"][0]["request_id"] == "req-1"
-
-    # 重啟後從 Checkpoint 續跑：直接從 wait_disk_op 查詢 req-1，絕不重複呼叫 run_resource_action！
-    lc_graph.invoke(None, config=lifecycle_config(job.id))
-    assert len(aria.deployments.submitted) == 1               # 仍然只有 1 次申請！
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == BOOTSTRAP_REVIEW
-
-
-def test_submit_disk_op_idempotency_skips_existing_extra_disk(lc_graph, monkeypatch):
-    """驗證冪等防呆：若 deployment 中已存在同名額外硬碟 (proj-demo035404-disk2-*)，submit_disk_op 自動略過不重送"""
-    aria = FakeAria()
-    aria.deployments.extra_resources = [
-        {"id": "disk-existing", "type": "Cloud.vSphere.Disk",
-         "properties": {"resourceName": "proj-demo035404-disk2-123456"}}
-    ]
-    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
-    aria.deployments.dep_status["dep-1"] = [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
-
-    job = _new_job(lc_graph, extra_disk_gb=100)
-    lc_graph.invoke(None, config=lifecycle_config(job.id))
-
-    answers = deque(["a"])
-    monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
-    monkeypatch.setattr(jobs_cli, "spawn_background_continuation", lambda *a, **k: None)
-    jobs_cli.run_disk_review(job.id, graph=lc_graph)
-
-    lc_graph.invoke(None, config=lifecycle_config(job.id))
-    assert aria.deployments.submitted == []                    # 偵測到已存在，0 次送出
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == BOOTSTRAP_REVIEW
-
-
-def test_bootstrap_interrupted_at_step3_resumes_from_jobs_without_reset(lc_graph, fakes, monkeypatch):  # noqa: F811
-    """
-    實測問題 2 驗證：
-    在初始設定第 3 步 (set_hostname.sh) 按 Ctrl+C 中斷後：
-    1. 階段顯示為 BOOTSTRAP_RUNNING (等你續跑：③ 初始設定 (中斷待續))
-    2. 進 /jobs 執行 run_bootstrap 時，直接從第 3 步 stream(None) 續跑，不重設也不重跑第 1、2 步！
-    """
-    ssh, _ = fakes
-    aria = FakeAria()
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
-    aria.deployments.dep_status["dep-1"] = [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
-
-    job = _new_job(lc_graph)
-    lc_graph.invoke(None, config=lifecycle_config(job.id))
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == BOOTSTRAP_REVIEW
-
-    # 在第 3 步 (set_hostname.sh) 模擬按 Ctrl+C
-    orig_exec = ssh.exec_command
-    interrupted = {"once": False}
-
-    def interrupt_at_step3(ip, cmd, **kw):
-        if cmd.endswith("set_hostname.sh") and not interrupted["once"]:
-            interrupted["once"] = True
-            raise KeyboardInterrupt()
-        return orig_exec(ip, cmd, **kw)
-
-    ssh.exec_command = interrupt_at_step3
-    answers = deque(["e", "cs_mode=SKIP, skip_disk=true", "a"])
-    monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
-
-    # 第一次執行 run_bootstrap：審核通過，跑完第 1、2 步，在第 3 步中斷
-    jobs_cli.run_bootstrap(job.id, graph=lc_graph)
-    j_mid = get_lifecycle_job(job.id, graph=lc_graph)
-    assert j_mid.stage == BOOTSTRAP_RUNNING
-    assert [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls] == ["add_pub_key.sh", "set_no_passwd.sh"]
-
-    # 第二次進入 /jobs 執行 run_bootstrap：不需再輸入任何審核選項 (answers 為空)，直接從第 3 步續跑到完成！
-    assert len(answers) == 0
-    jobs_cli.run_bootstrap(job.id, graph=lc_graph)
-
-    j_done = get_lifecycle_job(job.id, graph=lc_graph)
-    assert j_done.stage == DONE
+    done_job = get_job(boot_job.id)
+    assert done_job is not None and done_job.stage == DONE
+    assert any("初始設定完成" in n for n in drain_notices())
+    logs = get_job_logs(boot_job.id)
+    assert any("set_hostname.sh" in ln for ln in logs)
     assert [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls] == [
-        "add_pub_key.sh",
-        "set_no_passwd.sh",
-        "set_hostname.sh",
-        "set_passwords.sh",
-        "set_zabbix.sh",
-        "remover.sh",
+        "add_pub_key.sh", "set_no_passwd.sh", "set_hostname.sh",
+        "set_passwords.sh", "set_zabbix.sh", "remover.sh",
     ]
 
 
-def test_lifecycle_without_disk_goes_to_bootstrap_or_done(lc_graph, monkeypatch):
+def test_existing_vm_adjust_disk_runs_in_background_and_chains_bootstrap(job_env, fakes, monkeypatch):  # noqa: F811
+    """對現有 VM 呼叫 adjust_vm_disk(follow_up_bootstrap=True)：前景審核 → 背景執行硬碟 → 自動長出 Bootstrap 待審核"""
     aria = FakeAria()
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
+    aria.deployments.req_status["req-1"] = ["INPROGRESS", "SUCCESSFUL"]
+
+    agent, _ = build_agent_calling(
+        adjust_vm_disk,
+        {"ip": "10.0.0.99", "extra_disk_gb": 200, "follow_up_bootstrap": True, "os_type": "windows"},
+    )
+    requests, tool_msg = drive(agent, lambda req: {"action": "approve"})
+    assert len(requests) == 1
+    assert tool_msg.artifact["status"] == "submitted"
+    disk_job_id = tool_msg.artifact["job_id"]
+    assert wait_for_background(disk_job_id, timeout=5.0)
+    assert [a for _, a, _ in aria.deployments.submitted] == [ADD_DISK]
+
+    # 硬碟完成後應自動長出 Windows Bootstrap 待審核工作進 /jobs
+    active = list_jobs()
+    assert len(active) == 1
+    boot_job = active[0]
+    assert boot_job.kind == KIND_BOOTSTRAP and boot_job.stage == REVIEW and boot_job.os_type == "windows"
+    assert boot_job.ip == "10.0.0.99"
+
+
+def test_add_disk_idempotency_skips_duplicate_submission(job_env, monkeypatch):
+    """Add Disk 送出前偵測到同名硬碟已存在於 Aria 時應冪等略過，不重複送出"""
+    aria = FakeAria()
+    aria.deployments._resources["dep-1"].append(
+        {"id": "d-existing", "type": "Cloud.vSphere.Disk", "name": "proj-demo-AP01-disk2-123456"}
+    )
+    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
+
+    agent, _ = build_agent_calling(adjust_vm_disk, {"ip": "10.0.0.99", "extra_disk_gb": 100})
+    _, tool_msg = drive(agent, lambda req: {"action": "approve"})
+    job_id = tool_msg.artifact["job_id"]
+    assert wait_for_background(job_id, timeout=5.0)
+    assert aria.deployments.submitted == []
+    assert get_job(job_id).stage == DONE
+    assert any("略過重複送出" in ln for ln in get_job_logs(job_id))
+
+
+def test_build_job_windows_chains_windows_bootstrap(job_env, monkeypatch):
+    """Windows VM 建機完成 (無額外硬碟) 應自動串接 os_type=windows 的 vm_bootstrap 待審核"""
+    aria = FakeAria()
+    monkeypatch.setattr(build_nodes, "get_aria_client", lambda: aria)
     aria.deployments.dep_status["dep-1"] = [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
 
-    linux = _new_job(lc_graph)
-    lc_graph.invoke(None, config=lifecycle_config(linux.id))
-    assert get_lifecycle_job(linux.id, graph=lc_graph).stage == BOOTSTRAP_REVIEW
+    win = start_build_job(deployment_id="dep-1", deployment_name="proj-win-01", is_linux=False, auto_start=True)
+    assert wait_for_background(win.id, timeout=5.0)
 
-    win = _new_job(lc_graph, is_linux=False)
-    lc_graph.invoke(None, config=lifecycle_config(win.id))
-    win_job = get_lifecycle_job(win.id, graph=lc_graph)
-    assert win_job.stage == BOOTSTRAP_REVIEW
-    win_state = lc_graph.get_state(lifecycle_config(win.id)).values
-    assert win_state.get("os_type") == "windows"
+    active = list_jobs()
+    assert len(active) == 1
+    assert active[0].kind == KIND_BOOTSTRAP and active[0].stage == REVIEW and active[0].os_type == "windows"
 
 
-def test_lifecycle_failure_and_overdue_persisted_in_checkpoint(lc_graph, monkeypatch):
+def test_build_failure_overdue_and_consecutive_errors(job_env, monkeypatch):
+    """驗證 vm_build 逾時提醒、建立失敗與連續查詢失敗達上限時暫停並推播通知"""
     aria = FakeAria()
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
+    monkeypatch.setattr(build_nodes, "get_aria_client", lambda: aria)
     aria.deployments.dep_status["dep-1"] = [
         ("APPROVAL_PENDING", "CREATE_INPROGRESS"),
         ("APPROVAL_REJECTED", "CREATE_FAILED"),
     ]
-    job = _new_job(lc_graph)
-    # 將 stage_since 設為 25 小時前以觸發 overdue Checkpoint 存檔，再接著讀到 APPROVAL_REJECTED
-    lc_graph.update_state(
-        lifecycle_config(job.id),
-        {"stage_since": time.time() - 25 * 3600},
-        as_node="init_lifecycle",
-    )
-    lc_graph.invoke(None, config=lifecycle_config(job.id))
+    job = start_build_job(deployment_id="dep-1", deployment_name="proj-fail-01", auto_start=False)
+    g = get_job_graph(KIND_BUILD)
+    g.update_state(job_config(job.id), {"stage_since": time.time() - 25 * 3600}, as_node="init_build")
+    g.invoke(None, config=job_config(job.id))
     notices = drain_notices()
     assert any("超過 24 小時" in n for n in notices)
     assert any("失敗" in n for n in notices)
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == FAILED
+    assert get_job(job.id).stage == FAILED
 
-
-def test_consecutive_poll_errors_stops_and_notifies(lc_graph, monkeypatch):
-    """驗證連續查詢失敗達 MAX_CONSECUTIVE_POLL_ERRORS 次時推播通知並停止無限重試"""
-    aria = FakeAria()
+    # 連續查詢失敗達上限
     calls = {"n": 0}
 
     def broken_get(dep_id, expand=None):
@@ -321,214 +260,321 @@ def test_consecutive_poll_errors_stops_and_notifies(lc_graph, monkeypatch):
         raise RuntimeError("API unreachable")
 
     aria.deployments.get = broken_get
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
-
-    job = _new_job(lc_graph)
+    job2 = start_build_job(deployment_id="dep-2", deployment_name="proj-err-02", auto_start=False)
     with pytest.raises(RuntimeError):
-        lc_graph.invoke(None, config=lifecycle_config(job.id))
-
-    assert calls["n"] == lc_nodes.MAX_CONSECUTIVE_POLL_ERRORS
-    notices = drain_notices()
-    assert any("連續查詢失敗" in n and "已暫停背景輪詢" in n for n in notices)
+        g.invoke(None, config=job_config(job2.id))
+    assert calls["n"] == MAX_CONSECUTIVE_POLL_ERRORS
+    assert any("連續查詢失敗" in n for n in drain_notices())
 
 
-def test_adjust_vm_disk_tool_review_and_execute(monkeypatch):
-    aria = FakeAria()
-    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
-    monkeypatch.setattr(disk_nodes.time, "sleep", lambda s: None)
-    agent, _ = build_agent_calling(disk_tool.adjust_vm_disk, {"ip": "10.0.0.60", "extra_disk_gb": 50})
-    answers = iter([
-        {"action": "edit", "edits": {"extra_disk_gb": "abc"}},
-        {"action": "edit", "edits": {"boot_disk_gb": "80G", "extra_disk_gb": "100"}},
-        {"action": "approve"},
-    ])
-    requests, tool_msg = drive(agent, lambda req: next(answers))
-    assert len(requests) == 3 and any("整數" in e for e in requests[1]["errors"])
-    assert tool_msg.artifact["status"] == "completed"
-    assert [(a, i["capacityGb"]) for _, a, i in aria.deployments.submitted] == [(RESIZE_BOOT_DISK, 80), (ADD_DISK, 100)]
-
-
-def test_adjust_vm_disk_clear_boot_disk_and_re_review(monkeypatch):
-    """驗證輸入 boot_disk_gb=0, extra_disk_gb=200 後會先回到審核畫面確認，再核准只執行 Add Disk"""
-    aria = FakeAria()
-    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
-    monkeypatch.setattr(disk_nodes.time, "sleep", lambda s: None)
-    agent, _ = build_agent_calling(disk_tool.adjust_vm_disk, {"ip": "10.0.0.60", "boot_disk_gb": 200})
-    answers = iter([
-        {"action": "edit", "edits": {"boot_disk_gb": "0", "extra_disk_gb": "200"}},
-        {"action": "approve"},
-    ])
-    requests, tool_msg = drive(agent, lambda req: next(answers))
-    assert len(requests) == 2
-    fields_after = {f["key"]: f["value"] for f in requests[1]["fields"]}
-    assert fields_after["boot_disk_gb"] == "(不調整)"
-    assert fields_after["extra_disk_gb"] == 200
-    assert tool_msg.artifact["status"] == "completed"
-    assert [(a, i["capacityGb"]) for _, a, i in aria.deployments.submitted] == [(ADD_DISK, 200)]
-
-
-def test_adjust_vm_disk_tool_skips_existing_extra_disk_idempotently(monkeypatch):
-    """驗證整合後前景 adjust_vm_disk 也具備與背景一致的 Add Disk 冪等防呆"""
-    aria = FakeAria()
-    aria.deployments.extra_resources = [
-        {"id": "disk-existing", "type": "Cloud.vSphere.Disk",
-         "properties": {"resourceName": "proj-demo035404-disk2-654321"}}
-    ]
-    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
-    monkeypatch.setattr(disk_nodes.time, "sleep", lambda s: None)
-    agent, _ = build_agent_calling(disk_tool.adjust_vm_disk, {"ip": "10.0.0.60", "extra_disk_gb": 100})
-    _, tool_msg = drive(agent, lambda req: {"action": "approve"})
-    assert tool_msg.artifact["status"] == "completed"
-    assert aria.deployments.submitted == []
-
-
-def test_foreground_wait_disk_op_retries_transient_errors_then_gives_up(monkeypatch):
-    """前景 wait_disk_op：暫時性查詢失敗會退避重試；連續失敗達上限才回報錯誤 (request_id 保留)"""
-    calls = {"n": 0}
-
-    class _Dep:
-        def get_request(self, req_id):
-            calls["n"] += 1
-            if calls["n"] <= 2:
-                raise ConnectionError("boom")
-            return {"status": "SUCCESSFUL"}
-
-    ops = [{"action_id": ADD_DISK, "label": "加硬碟", "status": "running", "request_id": "req-1",
-            "submitted_at": time.time(), "inputs": {}, "error": ""}]
-    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: type("A", (), {"deployments": _Dep()})())
-    res = disk_nodes.wait_disk_op({"ops": ops}, sleep_fn=lambda s: None)
-    assert res["ops"][0]["status"] == "success" and not res.get("error")
-
-    class _DeadDep:
-        def get_request(self, req_id):
-            raise ConnectionError("down")
-
-    monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: type("A", (), {"deployments": _DeadDep()})())
-    res = disk_nodes.wait_disk_op({"ops": ops}, sleep_fn=lambda s: None)
-    assert "連續失敗" in res["error"] and "req-1" in res["error"]
-
-
-def test_vm_lifecycle_state_inherits_disk_and_bootstrap_fields():
-    """驗證 VMLifecycleState 透過 TypedDict 繼承完整包含 DiskState 與 BootstrapState 欄位"""
-    lc_keys = set(VMLifecycleState.__annotations__)
-    assert set(DiskState.__annotations__).issubset(lc_keys)
-    assert set(BootstrapState.__annotations__).issubset(lc_keys)
-
-
-def test_runner_per_task_wake_event_and_cleanup():
-    """驗證 Per-Task 喚醒事件互不干擾，且 cleanup_task_resources 會一併釋放鎖與快取"""
-    from subgraphs.common import runner
-
-    ev_a = runner._get_wake_event("task-a")
-    ev_b = runner._get_wake_event("task-b")
-    ev_a.clear()
-    ev_b.clear()
-    runner.get_job_lock("task-a")
-    runner.set_live_progress("task-a", {"note": "polling"})
-
-    runner.notify_poll_now("task-a")
-    assert ev_a.is_set() and not ev_b.is_set()
-
-    runner.cleanup_task_resources("task-a")
-    assert "task-a" not in runner._TASK_LOCKS
-    assert "task-a" not in runner._WAKE_EVENTS
-    assert runner.get_live_progress("task-a") == {}
-    runner.cleanup_task_resources("task-b")
-
-
-def test_prepare_bootstrap_retry_resumes_from_failed_step(lc_graph, fakes, monkeypatch):  # noqa: F811
-    """驗證 Bootstrap 某步驟失敗後，prepare_bootstrap_retry 保留已完成步驟，重試時從該失敗步續跑"""
+def test_bootstrap_background_failure_retries_from_failed_step(job_env, fakes, monkeypatch):  # noqa: F811
+    """背景 Bootstrap 在 set_hostname 失敗後自動切回 RETRY 保留已完成步驟，/jobs 續跑從該步接續"""
     ssh, _ = fakes
-    aria = FakeAria()
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
-    aria.deployments.dep_status["dep-1"] = [("SUCCESSFUL", "CREATE_SUCCESSFUL")]
-
-    job = _new_job(lc_graph)
-    lc_graph.invoke(None, config=lifecycle_config(job.id))
-
     orig_exec = ssh.exec_command
-    fail_hostname = {"active": True}
+    should_fail = {"on": True, "failed_attempts": 0}
 
-    def fail_at_hostname(ip, cmd, **kw):
-        if cmd.endswith("set_hostname.sh") and fail_hostname["active"]:
-            return 1, "", "hostnamectl error"
+    def flaky(ip, cmd, **kw):
+        if cmd.endswith("set_hostname.sh") and should_fail["on"]:
+            should_fail["failed_attempts"] += 1
+            return 1, "", "hostnamectl failed"
         return orig_exec(ip, cmd, **kw)
 
-    ssh.exec_command = fail_at_hostname
-    answers = deque(["e", "cs_mode=SKIP, skip_disk=true", "a"])
-    monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
+    ssh.exec_command = flaky
 
-    jobs_cli.run_bootstrap(job.id, graph=lc_graph)
-    # set_hostname 失敗會觸發 prepare_bootstrap_retry，回到 BOOTSTRAP_RUNNING 且保留前面已完成步驟
-    j_retry = get_lifecycle_job(job.id, graph=lc_graph)
-    assert j_retry.stage == BOOTSTRAP_RUNNING
+    from subgraphs.jobs import enqueue_bootstrap_job
+    job = enqueue_bootstrap_job(ip="10.0.0.99", hostname="proj-demo-AP01", os_type="linux",
+                                cs_mode="SKIP", skip_disk=True, needs_review=True)
+    monkeypatch.setattr(jobs_cli, "handle_review", lambda req: {"action": "approve", "edits": {}, "feedback": ""})
+    jobs_cli.run_job_review(job.id)
+    assert wait_for_background(job.id, timeout=5.0)
 
-    # 修復失敗原因後重試：應從 set_hostname.sh 續跑，不重跑 add_pub_key.sh 與 set_no_passwd.sh
-    fail_hostname["active"] = False
-    ssh.calls.clear()
-    jobs_cli.run_bootstrap(job.id, graph=lc_graph)
-    retry_cmds = [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls]
-    assert retry_cmds[0] == "set_hostname.sh"
-    assert "add_pub_key.sh" not in retry_cmds
-    assert "set_no_passwd.sh" not in retry_cmds
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == DONE
+    # 失敗後應自動進入 RETRY，保留前面成功的 add_pub_key / set_no_passwd，不重跑它們
+    j_retry = get_job(job.id)
+    assert j_retry is not None and j_retry.stage == RETRY and j_retry.step_index == 2
+    assert should_fail["failed_attempts"] >= 1
+    assert any("初始設定未完成" in n for n in drain_notices())
+    assert any("hostnamectl failed" in ln for ln in get_job_logs(job.id))
+
+    # 修復後從斷點續跑 (背景)
+    should_fail["on"] = False
+    jobs_cli.run_job_retry(job.id)
+    assert wait_for_background(job.id, timeout=5.0)
+
+    j_done = get_job(job.id)
+    assert j_done is not None and j_done.stage == DONE
+    executed = [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls]
+    assert executed.count("add_pub_key.sh") == 1
+    assert executed.count("set_no_passwd.sh") == 1
+    assert executed.count("set_hostname.sh") == 1
+    assert executed[-1] == "remover.sh"
 
 
-def test_cancel_lifecycle_job_archives_and_hides_from_list(lc_graph):
-    """驗證 cancel_lifecycle_job 會封存工作並從預設 list_lifecycle_jobs 清單中移除"""
-    from subgraphs.vm_lifecycle import cancel_lifecycle_job, list_lifecycle_jobs
-
-    job = _new_job(lc_graph, deployment_name="proj-cancel-01")
-    assert any(j.id == job.id for j in list_lifecycle_jobs(graph=lc_graph))
-
-    cancel_lifecycle_job(job.id, graph=lc_graph)
-    assert all(j.id != job.id for j in list_lifecycle_jobs(graph=lc_graph))
+def test_cancel_job_archives_and_hides_from_list(job_env):
+    job = start_build_job(deployment_id="dep-1", deployment_name="proj-cancel", auto_start=False)
+    assert job.stage == WAITING
+    assert any(j.id == job.id for j in list_jobs())
+    assert cancel_job(job.id) is True
+    assert all(j.id != job.id for j in list_jobs())
 
 
-def test_background_thread_end_to_end_and_track_tool(lc_graph, monkeypatch):
-    """驗證真實背景執行緒：wait_vm_ready → disk_review → submit_disk_op → wait_disk_op → bootstrap_review"""
+def test_skip_or_zero_disk_in_chain_still_spawns_bootstrap(job_env, monkeypatch):
+    """串接中硬碟審核按 [S] 略過或將大小改為 0 後，仍須正確交棒產生 vm_bootstrap；無後續時顯示已略過"""
+    from subgraphs.jobs import complete_job, enqueue_disk_job
+
     aria = FakeAria()
     monkeypatch.setattr(disk_nodes, "get_aria_client", lambda: aria)
-    monkeypatch.setattr(lc_nodes, "get_aria_client", lambda: aria)
-    aria.deployments.dep_status["dep-1"] = [
-        ("APPROVAL_PENDING", "CREATE_INPROGRESS"),
-        ("INPROGRESS", "CREATE_INPROGRESS"),
-        ("SUCCESSFUL", "CREATE_SUCCESSFUL"),
-    ]
 
-    job = start_lifecycle_job(
+    # 1. 串接流程在 vm_disk 審核按 [S] 略過 -> 封存 vm_disk 並長出 vm_bootstrap (保留 os_type)
+    disk_skip = enqueue_disk_job(
         deployment_id="dep-1",
-        deployment_name="proj-demo-AP03",
-        project="proj-demo",
-        is_linux=True,
-        boot_disk_gb=80,
-        extra_disk_gb=100,
-        auto_start=True,
-        graph=lc_graph,
+        deployment_name="proj-skip-01",
+        ip="10.0.0.99",
+        vm_name="proj-skip-01",
+        machine_id="m-1",
+        boot_disk_gb=150,
+        os_type="windows",
+        next_steps=[{"kind": KIND_BOOTSTRAP, "os_type": "windows"}],
+        needs_review=True,
+        auto_start=False,
     )
-    deadline = time.time() + 5
-    while time.time() < deadline and get_lifecycle_job(job.id, graph=lc_graph).stage != DISK_REVIEW:
-        time.sleep(0.02)
+    monkeypatch.setattr(jobs_cli, "handle_review", lambda req: {"action": "skip", "edits": {}, "feedback": "略過"})
+    jobs_cli.run_job_review(disk_skip.id)
 
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == DISK_REVIEW
-    calls_after_wait = aria.deployments.get_calls
-    assert calls_after_wait == 3
+    active = list_jobs()
+    assert len(active) == 1
+    assert active[0].kind == KIND_BOOTSTRAP and active[0].stage == REVIEW and active[0].os_type == "windows"
+    assert any("已略過硬碟調整" in n for n in drain_notices())
+    cancel_job(active[0].id)
 
-    tracked = json.loads(track_vm_jobs.invoke({"include_finished": False}))
-    assert tracked["total"] == 1 and tracked["jobs"][0]["stage"] == DISK_REVIEW
+    # 2. 串接流程在 vm_disk 審核將所有硬碟大小改為 0 (no_ops) -> 同樣交棒產生 vm_bootstrap
+    disk_zero = enqueue_disk_job(
+        deployment_id="dep-1",
+        deployment_name="proj-zero-02",
+        ip="10.0.0.99",
+        vm_name="proj-zero-02",
+        machine_id="m-1",
+        boot_disk_gb=150,
+        os_type="linux",
+        next_steps=[{"kind": KIND_BOOTSTRAP, "os_type": "linux"}],
+        needs_review=True,
+        auto_start=False,
+    )
+    answers = iter([
+        {"action": "edit", "edits": {"boot_disk_gb": "0"}, "feedback": ""},
+        {"action": "approve", "edits": {}, "feedback": ""},
+    ])
+    monkeypatch.setattr(jobs_cli, "handle_review", lambda req: next(answers))
+    jobs_cli.run_job_review(disk_zero.id)
 
-    answers = deque(["a"])
-    monkeypatch.setattr(review_mod.Prompt, "ask", staticmethod(lambda *a, **k: answers.popleft() if answers else ""))
-    jobs_cli.run_disk_review(job.id, graph=lc_graph)
-    assert aria.deployments.get_calls == calls_after_wait   # Resume 不重跑 wait_vm_ready
+    active2 = list_jobs()
+    assert len(active2) == 1
+    assert active2[0].kind == KIND_BOOTSTRAP and active2[0].stage == REVIEW and active2[0].os_type == "linux"
+    assert any("無需硬碟調整" in n for n in drain_notices())
+    cancel_job(active2[0].id)
 
-    deadline = time.time() + 5
-    while time.time() < deadline and get_lifecycle_job(job.id, graph=lc_graph).stage != BOOTSTRAP_REVIEW:
-        time.sleep(0.02)
+    # 3. 無後續步驟的獨立 vm_disk 被略過 -> 標籤應為「已略過硬碟調整」，而非「硬碟調整完成」
+    standalone_disk = enqueue_disk_job(
+        deployment_id="dep-1",
+        deployment_name="proj-alone-03",
+        ip="10.0.0.99",
+        vm_name="proj-alone-03",
+        machine_id="m-1",
+        extra_disk_gb=100,
+        needs_review=True,
+        auto_start=False,
+    )
+    monkeypatch.setattr(jobs_cli, "handle_review", lambda req: {"action": "skip", "edits": {}, "feedback": ""})
+    jobs_cli.run_job_review(standalone_disk.id)
+    done_disk = get_job(standalone_disk.id)
+    assert done_disk is not None and done_disk.stage == DONE and done_disk.stage_label == "已略過硬碟調整"
+    assert complete_job(standalone_disk.id) is None
 
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == BOOTSTRAP_REVIEW
-    assert [a for _, a, _ in aria.deployments.submitted] == [RESIZE_BOOT_DISK, ADD_DISK]
 
-    answers.extend(["s", ""])
-    jobs_cli.run_bootstrap(job.id, graph=lc_graph)
-    assert get_lifecycle_job(job.id, graph=lc_graph).stage == DONE
+def test_cancel_slow_bootstrap_stops_before_next_step_and_releases_lock(job_env, fakes, monkeypatch):  # noqa: F811
+    """長耗時 Bootstrap 步驟執行中途按 [X] 停止：不得清空取消旗標，須攔截後續步驟並在執行緒收尾後自動封存與釋放鎖"""
+    import threading
+    from subgraphs.common import runner
+    from subgraphs.jobs import enqueue_bootstrap_job, is_cancelling
+
+    ssh, _ = fakes
+    orig_exec = ssh.exec_command
+    step1_started = threading.Event()
+    allow_step1_finish = threading.Event()
+
+    def slow_step1(ip, cmd, **kw):
+        if cmd.endswith("add_pub_key.sh"):
+            step1_started.set()
+            allow_step1_finish.wait(timeout=5.0)
+        return orig_exec(ip, cmd, **kw)
+
+    ssh.exec_command = slow_step1
+
+    job = enqueue_bootstrap_job(
+        ip="10.0.0.99", hostname="proj-slow-01", os_type="linux",
+        cs_mode="SKIP", skip_disk=True, needs_review=True,
+    )
+    monkeypatch.setattr(jobs_cli, "handle_review", lambda req: {"action": "approve", "edits": {}, "feedback": ""})
+    jobs_cli.run_job_review(job.id)
+
+    assert step1_started.wait(timeout=5.0)
+    # 超過 2 秒等待門檻（此處設 0.05s 模擬）：應延遲封存、保持取消狀態與顯示「停止中...」
+    assert cancel_job(job.id, wait_timeout=0.05) is False
+    assert is_cancelling(job.id) is True
+    cur = get_job(job.id)
+    assert cur is not None and cur.stage_label == "停止中..."
+
+    # 放行第 1 步，背景執行緒應立即攔截第 2 步並完成自動封存與鎖釋放
+    allow_step1_finish.set()
+    assert wait_for_background(job.id, timeout=5.0)
+
+    executed = [c["cmd"].rsplit("/", 1)[-1] for c in ssh.calls]
+    assert executed == ["add_pub_key.sh"]
+    assert all(j.id != job.id for j in list_jobs())
+    assert job.id not in runner._TASK_LOCKS
+    assert any("已停止並移除" in n for n in drain_notices())
+
+
+def test_chained_step_merge_ignores_empty_values(job_env, monkeypatch):
+    """串接交棒時，next_steps 內的空字串 os_type 不應覆蓋上一步 carried 的有效 os_type"""
+    from subgraphs.jobs.manager import _spawn_chained_step
+
+    prev = start_build_job(deployment_id="dep-1", deployment_name="proj-merge-01", is_linux=False, auto_start=False)
+    nxt = _spawn_chained_step(
+        prev.id,
+        [{"kind": KIND_BOOTSTRAP, "os_type": "", "cs_mode": "MDR"}],
+        carried={
+            "deployment_id": "dep-1",
+            "deployment_name": "proj-merge-01",
+            "ip": "10.0.0.88",
+            "os_type": "windows",
+        },
+    )
+    assert nxt is not None and nxt.os_type == "windows"
+
+
+def test_progress_contextvar_propagates_to_child_thread(job_env):
+    """透過 contextvars 傳遞的背景 task_id 在子執行緒中仍可透過 emit() 寫入累計輸出"""
+    import contextvars
+    import threading
+    from core.progress import bind_background_task, emit
+
+    tid = "ctx-test-01"
+    with bind_background_task(tid):
+        ctx = contextvars.copy_context()
+        t = threading.Thread(target=lambda: ctx.run(emit, "child-thread-log"))
+        t.start()
+        t.join(timeout=2.0)
+
+    logs = get_job_logs(tid)
+    assert any("child-thread-log" in ln for ln in logs)
+
+
+def test_count_jobs_in_stages_uses_cached_stage_without_reading_checkpoints(job_env, monkeypatch):
+    """count_jobs_in_stages 應直接從 DB stage 快取統計，不重讀每個工作的 LangGraph Checkpoint"""
+    from subgraphs.jobs import REVIEW_STAGES, count_jobs_in_stages, enqueue_disk_job, manager as jm
+
+    start_build_job(deployment_id="dep-1", deployment_name="proj-cache-01", auto_start=False)
+    enqueue_disk_job(
+        deployment_id="dep-1",
+        deployment_name="proj-cache-02",
+        ip="10.0.0.99",
+        needs_review=True,
+        auto_start=False,
+    )
+
+    def fail_if_called(*a, **kw):
+        raise AssertionError("should not read checkpoint when stage cache is populated")
+
+    monkeypatch.setattr(jm, "get_job_graph", fail_if_called)
+    assert count_jobs_in_stages(REVIEW_STAGES) == 1
+    assert count_jobs_in_stages((WAITING,)) == 1
+
+
+def test_custom_job_spec_works_without_modifying_manager_or_cli(job_env, monkeypatch):
+    """透過 register_job_spec 註冊第 4 種客製工作後，JobManager 與 CLI 可直接支援建圖、串接、明細表與啟動恢復"""
+    from langgraph.graph import END, START, StateGraph
+    from typing_extensions import TypedDict
+    from core.persistence import get_app_store
+    from subgraphs.jobs import (
+        CompletionOutcome,
+        JobSpec,
+        complete_job,
+        get_job_spec,
+        job_config,
+        register_job_spec,
+        registry,
+        resume_active_jobs,
+        spawn_job_background,
+        thread_id_for,
+    )
+
+    class DemoState(TypedDict, total=False):
+        ip: str
+        done_ok: bool
+
+    def build_demo_graph(cp):
+        b = StateGraph(DemoState)
+        b.add_node("run_demo", lambda s: {"done_ok": True, "ip": s.get("ip") or "10.0.0.77"})
+        b.add_edge(START, "run_demo")
+        b.add_edge("run_demo", END)
+        return b.compile(checkpointer=cp, interrupt_before=["run_demo"])
+
+    custom_kind = "vm_custom_demo"
+    spec = JobSpec(
+        kind=custom_kind,
+        label="客製快照",
+        build_graph=build_demo_graph,
+        derive_stage=lambda nxt, vals, meta, intr, bg: (DONE, "快照完成") if not nxt else (WAITING, "快照排程中"),
+        evaluate_completion=lambda jid, title, vals, meta: CompletionOutcome(
+            status="succeeded",
+            carried={"ip": vals.get("ip") or "10.0.0.77", "deployment_name": title, "os_type": "linux"},
+            log_message="客製快照完成",
+            chain_notice_prefix=f"{title} 客製快照完成",
+            done_notice=f"✅ {title} 客製快照完成",
+        ),
+        active_stage=WAITING,
+        auto_resume_on_startup=True,
+        detail_table=lambda job: ("📸 快照明細", ("項目", "狀態"), [(job.title, job.stage_label)]),
+    )
+
+    try:
+        register_job_spec(spec)
+        assert get_job_spec(custom_kind).label == "客製快照"
+
+        jid = "demo0001"
+        tid = thread_id_for(jid)
+        get_app_store().save_job(
+            jid, tid, custom_kind, "proj-demo-snap",
+            meta={"next_steps": [{"kind": KIND_BOOTSTRAP}]},
+            stage=WAITING,
+        )
+        g = get_job_graph(custom_kind)
+        g.update_state(job_config(tid), {"ip": "10.0.0.77"}, as_node=START)
+
+        # 1. CLI render_job_detail 能直接渲染 JobSpec.detail_table
+        job_before = get_job(jid)
+        assert job_before is not None and job_before.kind_label == "客製快照"
+        jobs_cli.render_job_detail(job_before)
+
+        # 2. resume_active_jobs 依 auto_resume_on_startup=True 自動啟動背景並完成串接
+        spawned: list[str] = []
+        orig_spawn = spawn_job_background
+
+        def track_and_run(target_id, checkpointer=None):
+            spawned.append(target_id)
+            orig_spawn(target_id, checkpointer=checkpointer)
+
+        from subgraphs.jobs import manager as jm
+        monkeypatch.setattr(jm, "spawn_job_background", track_and_run)
+        resume_active_jobs()
+        assert spawned == [jid]
+        assert wait_for_background(jid, timeout=5.0)
+
+        # 完成後自動封存客製工作並串接出下一筆 vm_bootstrap (REVIEW)
+        active = list_jobs()
+        assert len(active) == 1
+        assert active[0].kind == KIND_BOOTSTRAP and active[0].stage == REVIEW and active[0].ip == "10.0.0.77"
+        assert any("客製快照完成" in n for n in drain_notices())
+        assert complete_job(jid) is None
+    finally:
+        registry._REGISTRY.pop(custom_kind, None)

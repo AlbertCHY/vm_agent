@@ -14,7 +14,6 @@ import config
 from cli.render import console, msg_text, msg_thoughts, print_progress, print_thoughts, print_tool_result
 from cli.review import handle_review
 from core.persistence import get_app_store
-from subgraphs.vm_lifecycle import LIFECYCLE_KIND
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +105,9 @@ def resolve_dangling_interrupts(agent, thread_id: str) -> Optional[str]:
 
 def check_startup_interrupted_session(agent) -> Optional[str]:
     """CLI 啟動時檢查是否有上次未完成審核的前景對話 Session，若有則詢問是否續跑"""
-    for s in get_app_store().list_sessions(limit=20, exclude_kind=LIFECYCLE_KIND):
+    for s in get_app_store().list_sessions(limit=20):
+        if s.get("kind") not in ("chat", "ticket"):
+            continue
         tid = s["thread_id"]
         run_config = _run_config(tid)
         try:

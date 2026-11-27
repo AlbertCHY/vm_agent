@@ -14,7 +14,7 @@
 | **VM 開立申請（Provisioning）** | 動態讀取 Aria Service Broker Catalog Schema 與 Custom Form，結合 LLM 意圖抽取與確定性規則（`policies/vm_defaults.toml`），經人工審核後送出申請 |
 | **Day-2 硬碟調整（Disk）** | 支援擴充系統碟（Resize Boot Disk）與加掛額外硬碟（Add Disk），具備人工審核、單動作 Checkpoint 保護與 Add Disk 冪等防呆 |
 | **新機初始化（Bootstrap）** | 支援 Linux（`policies/bootstrap_steps_linux.toml`）與 Windows OpenSSH（`policies/bootstrap_steps_windows.toml`）：SSH 公鑰、Hostname、強密碼輪替、Zabbix、CrowdStrike、系統碟擴容與額外硬碟掛載；Linux 含免密 sudo 與清理，Windows 含 DNS、排程清理、SCCM、系統檢查與完成後重開機 |
-| **VM 生命週期背景追蹤（`/jobs`）** | VM 申請送出後自動啟動 `VMLifecycleGraph`：背景等待 Aria 審核與建機 ➔ 抵達「② 硬碟調整」審核 ➔ 背景執行硬碟調整 ➔ 抵達「③ 初始設定」審核與斷點續跑 |
+| **統一背景工作（`/jobs`）** | 整合 `vm_build`（建機追蹤）、`vm_disk`（硬碟調整）、`vm_bootstrap`（初始設定）三個獨立可背景執行子圖並支援 `next_steps` 串接；背景執行過程不搶主畫面輸出，進 `/jobs` 選中工作可查看累計執行輸出與步驟報告，完成或失敗時自動跳行通知 |
 
 ---
 
@@ -28,15 +28,15 @@
      │                                      ├── 唯讀查詢與診斷 Tools (tools/aria_query_tools.py, vm_diag_tools.py)
      │                                      ├── 工單解析 Tool (tools/ticket_tools.py ──► parsers/ + Ollama)
      │                                      ├── 追蹤進度查詢 Tool (tools/job_tools.py)
-     │                                      └── 變更流程子圖 Tools (透過 subgraphs/common/runner.py 呼叫)
-     │                                             ├─► vm_provisioning (開機申請 ──► 送出後啟動 vm_lifecycle)
-     │                                             ├─► vm_disk         (現有機器單獨調整硬碟)
-     │                                             └─► vm_bootstrap    (現有機器單獨跑初始設定)
+     │                                      └── 變更流程子圖 Tools (前景審核 ➔ 核准後送入 /jobs 背景執行)
+     │                                             ├─► vm_provisioning (開機申請 ──► 啟動 vm_build 背景串接)
+     │                                             ├─► vm_disk         (硬碟調整 ──► 核准後進背景，可串接 vm_bootstrap)
+     │                                             └─► vm_bootstrap    (初始設定 ──► 核准後進背景逐步執行)
      │
-     └── 背景追蹤 (/jobs) ───────────► [生命週期子圖] subgraphs/vm_lifecycle/ (VMLifecycleGraph)
-                                            └── wait_vm_ready (背景) ➔ disk_review (HITL)
-                                                ➔ submit_disk_op / wait_disk_op (背景)
-                                                ➔ bootstrap_review (HITL) ➔ connect/run_step/cleanup (前景逐步)
+     └── 統一背景工作 (/jobs) ────────► [JobManager] subgraphs/jobs/
+                                            ├── vm_build     (背景等建機 ➔ 自動串接 vm_disk / vm_bootstrap)
+                                            ├── vm_disk      (審核 ➔ 背景 submit/wait ➔ 可串接 vm_bootstrap)
+                                            └── vm_bootstrap (審核 ➔ 背景逐步執行 ➔ 累計輸出檢視與斷點續跑)
 ```
 
 ### 專案目錄結構
@@ -49,7 +49,7 @@ vm_agent/
 ├── prompts.toml                  # 公開版 Prompt 設定 (可用 prompts.local.toml 覆蓋)
 ├── cli/                          # Rich CLI 介面層 (不含業務邏輯)
 │   ├── session.py                #   前景對話串流、interrupt 恢復、中斷自動續跑
-│   ├── jobs.py                   #   /jobs 生命週期追蹤管理介面
+│   ├── jobs.py                   #   /jobs 統一背景工作管理介面
 │   ├── review.py                 #   通用人工審核 (HITL) 畫面
 │   └── render.py                 #   訊息、思考過程、工具與工單表格渲染
 ├── supervisor/
@@ -67,9 +67,10 @@ vm_agent/
 │   │   ├── review.py             #   通用 HITL 協定 (ReviewRequest / ask_review)
 │   │   └── runner.py             #   前景同步與背景非同步子圖執行器、通用輪詢骨架
 │   ├── vm_provisioning/          #   VM 開立申請子圖 (state/reasoning/resolver/nodes/graph/tool)
-│   ├── vm_disk/                  #   Day-2 硬碟調整子圖 (state/executor/nodes/graph/tool)
-│   ├── vm_bootstrap/             #   Linux / Windows 新機初始化子圖 (state/steps/nodes/graph/tool)
-│   └── vm_lifecycle/             #   VM 全生命週期子圖 (state/nodes/graph/service)
+│   ├── vm_build/                 #   VM 建機追蹤子圖 (背景輪詢 Aria 審核與建立進度 + job_spec)
+│   ├── vm_disk/                  #   Day-2 硬碟調整子圖 (前景審核 ➔ 背景執行，可串接 bootstrap + job_spec)
+│   ├── vm_bootstrap/             #   Linux / Windows 新機初始化子圖 (前景審核 ➔ 背景逐步執行 + job_spec)
+│   └── jobs/                     #   統一背景工作管理器 (models/registry/manager，支援 JobSpec 擴充、next_steps 串接與累計輸出)
 ├── clients/                      # 無狀態底層連線 SDK
 │   ├── aria/                     #   Aria REST API (session/catalog/forms/iaas/deployment/vro/inspect)
 │   ├── ssh_client.py             #   Paramiko SSH/SFTP (Linux/Windows OpenSSH、PAM 改密碼、機密暫存檔注入)
@@ -190,9 +191,9 @@ python -m pytest -v
 
 ### 測試模組一覽
 - `tests/test_aria_client.py`：Aria JWT 效期解析、401 自動重登、分頁防呆、Catalog 送出與 Custom Form 欄位合併
-- `tests/test_provisioning_flow.py`：VM 開機申請完整流程（補問續跑、審核修改、快取、生命週期工作建立）
+- `tests/test_provisioning_flow.py`：VM 開機申請完整流程（補問續跑、審核修改、快取、背景追蹤工作建立）
 - `tests/test_bootstrap_flow.py`：新機初始化審核、密碼重產與重啟遺失恢復、機密零外洩驗證、斷點續跑
-- `tests/test_jobs.py`：VM 生命週期背景輪詢、不重跑掃描、Add Disk 冪等與崩潰防重送、Bootstrap 中斷續跑、前景 `adjust_vm_disk`、Per-Task 喚醒與資源釋放
+- `tests/test_jobs.py`：統一背景工作（JobSpec、vm_build / vm_disk / vm_bootstrap 串接與輪詢）、不重跑掃描、Add Disk 冪等與崩潰防重送、Bootstrap 中斷續跑、前景 `adjust_vm_disk`、Per-Task 喚醒與資源釋放
 - `tests/test_cli.py`：通用審核畫面渲染、對話回合與中斷自動詢問續跑
 - `tests/test_policy.py`：Policy fallback 載入、網段與命名規則、`bootstrap_steps_{linux,windows}.toml` 機密隔離檢查
 - `tests/test_ticket_form.py`：申請單正規表示式預處理、`parsers.ticket_parser.parse_ticket` 補值、路徑遍歷防呆與快取驗證

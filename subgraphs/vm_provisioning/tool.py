@@ -9,9 +9,9 @@ HITL 設計：
     子圖回報 needs_clarification 時，把已解析的規格與對話暫存於 AppStore.pipeline_sessions，
     Supervisor 帶相同 session_id 再次呼叫時延續。
 
-後續生命週期追蹤：
-    送出申請後，啟動純 LangGraph 的 VMLifecycleGraph (subgraphs.vm_lifecycle)，
-    於背景執行 wait_vm_ready 節點，完成後自動停在 disk_review / bootstrap_review 的 interrupt() 節點等待審核。
+後續背景工作追蹤：
+    送出申請後透過 subgraphs.jobs.start_build_job 啟動 vm_build 背景工作等待建立完成，
+    再依 next_steps 自動銜接 vm_disk 與 vm_bootstrap 的人工審查 (/jobs)。
 """
 from functools import lru_cache
 from typing import Annotated, Any, Optional
@@ -21,7 +21,7 @@ from langchain_core.tools import InjectedToolCallId, tool
 
 from core.persistence import get_app_store
 from subgraphs.common.runner import PipelineResult, derive_session_id, last_ai_text, run_pipeline
-from subgraphs.vm_lifecycle import start_lifecycle_job
+from subgraphs.jobs import start_build_job
 from subgraphs.vm_provisioning.graph import build_vm_provisioning_graph
 
 PIPELINE_KIND = "vm_provisioning"
@@ -96,7 +96,7 @@ def run_vm_pipeline(requirement_description: str, session_id: Optional[str] = No
 
 
 def create_tracking_job(result: PipelineResult):
-    """申請送出後啟動 VMLifecycleGraph 子圖 (背景等待建立 → 硬碟調整審核 → 初始設定審核)"""
+    """申請送出後啟動 vm_build 背景工作 (完成後依 next_steps 串接硬碟調整與初始設定審核)"""
     exec_res = result.data.get("execution_result") or {}
     if not exec_res.get("deployment_id"):
         return None
@@ -104,7 +104,7 @@ def create_tracking_job(result: PipelineResult):
     template = (exec_res.get("template") or {}).get("name", "")
     os_image = str((exec_res.get("inputs") or {}).get("OSimage") or "")
     is_windows = "win" in os_image.lower() or "windows" in template.lower()
-    return start_lifecycle_job(
+    return start_build_job(
         deployment_id=exec_res["deployment_id"],
         deployment_name=exec_res.get("deployment_name") or "",
         project=(exec_res.get("project") or {}).get("name", ""),

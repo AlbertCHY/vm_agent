@@ -44,10 +44,14 @@ def test_handle_review_renders_secret_and_collects_edits(scripted_input):
 
 
 def test_run_turn_with_review(fakes, scripted_input, monkeypatch):  # noqa: F811
+    from subgraphs.jobs import list_jobs, wait_for_background
+
     agent, _ = build_agent_calling(bootstrap_vm_pipeline, {"ip": "10.0.0.20", "cs_mode": "SKIP", "skip_disk": True})
     scripted_input.extend(["a"])
     final = session_mod.run_turn(agent, "cli-t1", "幫我對 10.0.0.20 做基本設定")
     assert final == "done"
+    for j in list_jobs():
+        wait_for_background(j.id, timeout=5.0)
     ssh, sink = fakes
     assert ssh.calls and len(sink.records) == 1
     assert list(agent.get_state({"configurable": {"thread_id": "cli-t1"}}).interrupts or ()) == []
@@ -69,9 +73,13 @@ def test_interrupted_turn_auto_prompts_resume_or_cancel(fakes, scripted_input): 
     assert len(agent.get_state({"configurable": {"thread_id": "cli-t2"}}).interrupts) == 1
 
     # 下次呼叫 resolve_dangling_interrupts 時自動詢問「是否繼續審核？[y/n]」→ 輸入 y 並核准 a
+    from subgraphs.jobs import list_jobs, wait_for_background
+
     scripted_input.extend(["y", "a"])
     final = session_mod.resolve_dangling_interrupts(agent, "cli-t2")
     assert final == "done"
+    for j in list_jobs():
+        wait_for_background(j.id, timeout=5.0)
     assert list(agent.get_state({"configurable": {"thread_id": "cli-t2"}}).interrupts or ()) == []
 
 
@@ -97,13 +105,14 @@ def test_interrupted_turn_cancel_clears_interrupts(fakes, scripted_input):  # no
     assert ssh.calls == []
 
 
-def test_check_startup_interrupted_session_resumes_chat_and_skips_lifecycle(fakes, scripted_input):  # noqa: F811
-    """啟動恢復應略過 vm_lifecycle session，並針對未完成審核的前景對話詢問續跑"""
+def test_check_startup_interrupted_session_resumes_chat_and_skips_bg_jobs(fakes, scripted_input):  # noqa: F811
+    """背景工作獨立存放在 background_jobs 表，不干擾啟動時對未完成審核對話 Session 的恢復詢問"""
     from core.persistence import get_app_store
-    from subgraphs.vm_lifecycle import LIFECYCLE_KIND
+    from subgraphs.jobs import KIND_BUILD, list_jobs, wait_for_background
 
     store = get_app_store()
-    store.touch_session("vmjob-ignore1", "bg-job", kind=LIFECYCLE_KIND)
+    store.save_job("ignore01", "job-ignore01", KIND_BUILD, "bg-job")
+    store.touch_session("vmjob-legacy", "old-lc", kind="vm_lifecycle")
 
     agent, _ = build_agent_calling(bootstrap_vm_pipeline, {"ip": "10.0.0.22", "cs_mode": "SKIP", "skip_disk": True})
 
@@ -117,5 +126,7 @@ def test_check_startup_interrupted_session_resumes_chat_and_skips_lifecycle(fake
 
     scripted_input.extend(["y", "a"])
     resumed_tid = session_mod.check_startup_interrupted_session(agent)
+    for j in list_jobs():
+        wait_for_background(j.id, timeout=5.0)
     assert resumed_tid == "cli-startup-1"
     assert list(agent.get_state({"configurable": {"thread_id": "cli-startup-1"}}).interrupts or ()) == []
